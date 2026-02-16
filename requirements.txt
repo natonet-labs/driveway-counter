@@ -1,0 +1,14 @@
+# Core dependencies for Hailo Driveway Counter
+# Install with: pip install -r requirements.txt
+
+# Environment configuration
+python-dotenv>=1.0.0
+
+# Computer vision
+opencv-python==4.11.0.86
+
+# Numerical computing (pinned for Hailo compatibility)
+numpy==1.26.4
+
+# Note: GStreamer (gi) and Hailo Python bindings come from system packages
+# Create venv with: python3 -m venv .venv --system-site-packages
