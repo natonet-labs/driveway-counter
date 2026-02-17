@@ -2,7 +2,8 @@
 
 # Hailo Driveway Counter
 
-Real-time AI driveway monitor: count vehicles, people, pets with Hailo-accelerated YOLOv8 (26 TOPS AI HAT+) on Raspberry Pi 5.
+**15 FPS AI driveway counter on RPi 5 + Hailo 26 TOPS**  
+*Single script, 7% CPU, zone tracking, JSON reports*
 
 ## Overview
 
