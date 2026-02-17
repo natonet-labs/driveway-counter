@@ -1,4 +1,5 @@
-[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-orange)] [![RPi5](https://img.shields.io/badge/RPi-5-green?logo=raspberrypi)]
+[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-blue)] [![RPi5](https://img.shields.io/badge/RPi-5-E30B5D?logo=Raspberrypi)]
+
 # Hailo Driveway Counter
 
 Real-time AI driveway monitor: count vehicles, people, pets with Hailo-accelerated YOLOv8 (26 TOPS AI HAT+) on Raspberry Pi 5.
@@ -67,17 +68,11 @@ For detailed installation, troubleshooting, and systemd setup, see [SETUP_GUIDE.
 
 ## Contributing
 
-1. Fork the repo.
-2. Create branch: `git checkout -b feature/amazing-feature`
-3. Commit: `git commit -m 'Add amazing feature'`
-4. Push: `git push origin feature/amazing-feature`
-5. Open PR.
-
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
-MIT – see LICENSE file.
+MIT – see [LICENSE.md](LICENSE.md) file.
 
 ## Acknowledgments
 
