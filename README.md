@@ -29,7 +29,7 @@ Turn your Raspberry Pi 5 into a high-performance AI security camera with this si
 
 https://github.com/user-attachments/assets/208b9c0f-3f4d-4b04-af89-2d2af14d28bb
 
-Terminal output showing live detection, tracking, and zone counting. Watch updates to ENTER/EXIT zones, TrackingID, FPS, and Tracking counts in real-time.
+Terminal output showing live detection, tracking, and zone counting. Watch real-time updates: vehicles/people entering and exiting zones, unique tracking IDs, FPS performance, and cumulative counts.
 
 ## Hardware Requirements
 
