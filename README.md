@@ -26,8 +26,10 @@ Turn your Raspberry Pi 5 into a high-performance AI security camera with this si
 - Daily JSON reports with midnight rollover
 
 ## Demo
-[![Zone Calibration](screenshot-web-ui.png)](screenshot-web-ui.png)
-Live polygon zones, tracking, and sample JSON.
+
+https://github.com/user-attachments/assets/208b9c0f-3f4d-4b04-af89-2d2af14d28bb
+
+Terminal output showing live detection, tracking, and zone counting. Watch FPS, CPU usage, and object counts update in real-time.
 
 ## Hardware Requirements
 
