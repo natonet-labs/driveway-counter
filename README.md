@@ -1,4 +1,4 @@
-[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-orange?logo=ai&logoColor=white)] [![RPi5](https://img.shields.io/badge/RPi-5-E30B5D?logo=raspberrypi&logoColor=white)] [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)] [![License](https://img.shields.io/badge/License-MIT-yellow.svg)]
+[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-orange?logo=ai&logoColor=white)] [![RPi5](https://img.shields.io/badge/Raspberry%20Pi-5-E30B5D?logo=raspberrypi&logoColor=white)] [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)]
 
 # Hailo Driveway Counter
 
