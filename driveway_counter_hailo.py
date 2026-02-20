@@ -216,23 +216,23 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                 prev_cx, _ = history[-2]
                 vx = cx - prev_cx  # Positive=rightward (entry), negative=leftward (exit)
 
-            # Entry: in zone + rightward motion + first time
-            if in_zone and track_state['zone'] != 'in':
-                if not track_state['entered'] and vx > 5:  # Tune threshold
-                    dailystats["entries"] += 1
-                    track_state['entered'] = True
-                    logger.info("➡️ ENTER ZONE (vx=%.1f): %s ID:%d conf=%.2f", vx, label, track_id, confidence)
-                track_state['zone'] = 'in'
+            cross_dir = None
+            if in_zone and vx > 5:  # Rightward through zone: entry
+                cross_dir = 'entry'
+            elif not in_zone and vx < -5:  # Leftward through zone: exit
+                cross_dir = 'exit'
 
-            # Exit: out zone + leftward motion + first time
-            elif not in_zone and track_state['zone'] == 'in':
-                if not track_state['exited'] and vx < -5:
-                    dailystats["exits"] += 1
-                    track_state['exited'] = True
-                    logger.info("➡️ EXIT ZONE (vx=%.1f):  %s ID:%d conf=%.2f", vx, label, track_id, confidence)
-                track_state['zone'] = 'out'
+            if cross_dir == 'entry' and not track_state['entered']:
+                dailystats["entries"] += 1
+                track_state['entered'] = True
+                logger.info("➡️ ENTER ZONE (vx=%.1f): %s ID:%d conf=%.2f", vx, label, track_id, confidence)
+            elif cross_dir == 'exit' and not track_state['exited']:
+                dailystats["exits"] += 1
+                track_state['exited'] = True
+                logger.info("➡️ EXIT ZONE (vx=%.1f):  %s ID:%d conf=%.2f", vx, label, track_id, confidence)
 
-            tracked_zones[track_id] = track_state
+            track_state['zone'] = 'in' if in_zone else 'out'
+
 
             if ISDEBUG:
                 logger.debug("Track %d %s@%.2f zone=%s pos=(%d,%d) vx=%.1f", track_id, label, confidence, 
