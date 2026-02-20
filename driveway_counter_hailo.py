@@ -152,14 +152,7 @@ def save_report() -> None:
 
 
 def on_new_sample(sink: Any) -> Gst.FlowReturn:
-    """Process detections: count objects entering/leaving single zone (per-track + direction).
-
-    Args:
-        sink: GStreamer appsink element
-
-    Returns:
-        Gst.FlowReturn: Flow status (OK or error)
-    """
+    """Process detections: count zone crossings by direction (robust per-track)."""
     global dailystats, frame_count, last_log, tracked_zones, track_last_seen, centroid_history
 
     sample = sink.emit("pull-sample")
@@ -176,12 +169,9 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
         for detection in detections:
             label: str = detection.get_label()
             confidence: float = detection.get_confidence()
-
-            # Filter by confidence (lower threshold for low-res stream)
             if confidence < CONF_THRESH:
                 continue
 
-            # Get tracking ID
             unique_ids = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
             if not unique_ids:
                 if ISDEBUG:
@@ -190,23 +180,21 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
 
             track_id: int = unique_ids[0].get_id()
             bbox = detection.get_bbox()
-
-            # Calculate centroid
             cx: int = int((bbox.xmin() + bbox.xmax()) / 2 * IMG_W)
             cy: int = int((bbox.ymin() + bbox.ymax()) / 2 * IMG_H)
 
-            # Skip detections outside frame boundaries
             if not (0 <= cx < IMG_W and 0 <= cy < IMG_H):
                 continue
 
-            # Single zone membership check
             in_zone: bool = tracking_mask[cy, cx] > 0
-
-            # Update tracking state
-            track_state = tracked_zones.get(track_id, {'zone': None, 'entered': False, 'exited': False})
             track_last_seen[track_id] = datetime.now()
 
-            # Velocity history (for direction)
+            # ENSURE PERSISTENT STATE (fix)
+            if track_id not in tracked_zones:
+                tracked_zones[track_id] = {'zone': None, 'entered': False, 'exited': False}
+            track_state = tracked_zones[track_id]
+
+            # Velocity history
             history = centroid_history.get(track_id, deque(maxlen=3))
             history.append((cx, cy))
             centroid_history[track_id] = history
@@ -214,12 +202,13 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             vx = 0
             if len(history) >= 2:
                 prev_cx, _ = history[-2]
-                vx = cx - prev_cx  # Positive=rightward (entry), negative=leftward (exit)
+                vx = cx - prev_cx
 
+            # CROSS-DIRECTION LOGIC (your replacement)
             cross_dir = None
-            if in_zone and vx > 5:  # Rightward through zone: entry
+            if in_zone and vx > 5:  # Rightward in zone: entry
                 cross_dir = 'entry'
-            elif not in_zone and vx < -5:  # Leftward through zone: exit
+            elif not in_zone and vx < -5:  # Leftward out zone: exit
                 cross_dir = 'exit'
 
             if cross_dir == 'entry' and not track_state['entered']:
@@ -232,45 +221,35 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                 logger.info("➡️ EXIT ZONE (vx=%.1f):  %s ID:%d conf=%.2f", vx, label, track_id, confidence)
 
             track_state['zone'] = 'in' if in_zone else 'out'
-
+            tracked_zones[track_id] = track_state  # COMMIT
 
             if ISDEBUG:
                 logger.debug("Track %d %s@%.2f zone=%s pos=(%d,%d) vx=%.1f", track_id, label, confidence, 
-                           "IN" if in_zone else "OUT", cx, cy, vx)
+                           track_state['zone'], cx, cy, vx)
 
     except Exception as e:
         if ISDEBUG:
             logger.exception("Detection error: %s", e)
 
-    # Periodic statistics reporting and maintenance (unchanged)
+    # Stats + cleanup (unchanged)
     now: float = datetime.now().timestamp()
     if now - last_log >= STATS_LOG_INTERVAL:
         fps: float = frame_count / (now - last_log) if now != last_log else 0
-
-        # Clean up stale tracks (not seen for TRACK_TIMEOUT seconds)
         now_dt: datetime = datetime.now()
         stale_ids: list[int] = [
-            tid
-            for tid, last_seen in track_last_seen.items()
+            tid for tid, last_seen in track_last_seen.items()
             if (now_dt - last_seen).total_seconds() > TRACK_TIMEOUT
         ]
         for tid in stale_ids:
             tracked_zones.pop(tid, None)
             track_last_seen.pop(tid, None)
-            centroid_history.pop(tid, None)  # New cleanup
+            centroid_history.pop(tid, None)
 
-        logger.info(
-            "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
-            dailystats["entries"],
-            dailystats["exits"],
-            fps,
-            len(tracked_zones),
-        )
-
+        logger.info("📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d", 
+                   dailystats["entries"], dailystats["exits"], fps, len(tracked_zones))
         last_log = now
         frame_count = 0
 
-    # Handle date rollover at midnight
     today: str = datetime.now().strftime("%Y-%m-%d")
     if dailystats["date"] != today:
         save_report()
