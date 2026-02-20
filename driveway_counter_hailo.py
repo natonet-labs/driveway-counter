@@ -11,7 +11,7 @@ import ast
 import json
 import logging
 import os
-from collections import defaultdict
+from collections import deque
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -114,7 +114,8 @@ if ISDEBUG:
 # ============================================================================
 
 # Tracking state
-tracked_zones: dict[int, str | None] = defaultdict(lambda: None)  # "in" or "out"
+tracked_zones: dict[int, dict[str, Any]] = {}  # "in" or "out"
+centroid_history: dict[int, deque[tuple[int, int]]] = {}  # New for velocity
 track_last_seen: dict[int, datetime] = {}
 
 # Daily statistics
@@ -151,7 +152,7 @@ def save_report() -> None:
 
 
 def on_new_sample(sink: Any) -> Gst.FlowReturn:
-    """Process detections: count objects entering/leaving single zone.
+    """Process detections: count objects entering/leaving single zone (per-track + direction).
 
     Args:
         sink: GStreamer appsink element
@@ -159,7 +160,7 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
     Returns:
         Gst.FlowReturn: Flow status (OK or error)
     """
-    global dailystats, frame_count, last_log, tracked_zones, track_last_seen
+    global dailystats, frame_count, last_log, tracked_zones, track_last_seen, centroid_history
 
     sample = sink.emit("pull-sample")
     if sample is None:
@@ -167,10 +168,8 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
 
     frame_count += 1
     buffer = sample.get_buffer()
-
     try:
         import hailo
-
         roi = hailo.get_roi_from_buffer(buffer)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
@@ -204,50 +203,46 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             in_zone: bool = tracking_mask[cy, cx] > 0
 
             # Update tracking state
+            track_state = tracked_zones.get(track_id, {'zone': None, 'entered': False, 'exited': False})
             track_last_seen[track_id] = datetime.now()
 
-            # Entry detection: object entering zone
-            if in_zone and tracked_zones.get(track_id) != "in":
-                dailystats["entries"] += 1
-                tracked_zones[track_id] = "in"
-                logger.info(
-                    "➡️  ENTER ZONE: %s ID:%d conf=%.2f",
-                    label,
-                    track_id,
-                    confidence,
-                )
-                if ISDEBUG:
-                    logger.debug("   Zone hit at (%d,%d)", cx, cy)
+            # Velocity history (for direction)
+            history = centroid_history.get(track_id, deque(maxlen=3))
+            history.append((cx, cy))
+            centroid_history[track_id] = history
 
-            # Exit detection: object leaving zone
-            elif not in_zone and tracked_zones.get(track_id) == "in":
-                dailystats["exits"] += 1
-                tracked_zones[track_id] = "out"
-                logger.info(
-                    "➡️  EXIT ZONE:  %s ID:%d conf=%.2f",
-                    label,
-                    track_id,
-                    confidence,
-                )
-                if ISDEBUG:
-                    logger.debug("   Zone exit at (%d,%d)", cx, cy)
+            vx = 0
+            if len(history) >= 2:
+                prev_cx, _ = history[-2]
+                vx = cx - prev_cx  # Positive=rightward (entry), negative=leftward (exit)
+
+            # Entry: in zone + rightward motion + first time
+            if in_zone and track_state['zone'] != 'in':
+                if not track_state['entered'] and vx > 5:  # Tune threshold
+                    dailystats["entries"] += 1
+                    track_state['entered'] = True
+                    logger.info("➡️ ENTER ZONE (vx=%.1f): %s ID:%d conf=%.2f", vx, label, track_id, confidence)
+                track_state['zone'] = 'in'
+
+            # Exit: out zone + leftward motion + first time
+            elif not in_zone and track_state['zone'] == 'in':
+                if not track_state['exited'] and vx < -5:
+                    dailystats["exits"] += 1
+                    track_state['exited'] = True
+                    logger.info("➡️ EXIT ZONE (vx=%.1f):  %s ID:%d conf=%.2f", vx, label, track_id, confidence)
+                track_state['zone'] = 'out'
+
+            tracked_zones[track_id] = track_state
 
             if ISDEBUG:
-                logger.debug(
-                    "Track %d %s@%.2f zone=%s pos=(%d,%d)",
-                    track_id,
-                    label,
-                    confidence,
-                    "IN" if in_zone else "OUT",
-                    cx,
-                    cy,
-                )
+                logger.debug("Track %d %s@%.2f zone=%s pos=(%d,%d) vx=%.1f", track_id, label, confidence, 
+                           "IN" if in_zone else "OUT", cx, cy, vx)
 
     except Exception as e:
         if ISDEBUG:
             logger.exception("Detection error: %s", e)
 
-    # Periodic statistics reporting and maintenance
+    # Periodic statistics reporting and maintenance (unchanged)
     now: float = datetime.now().timestamp()
     if now - last_log >= STATS_LOG_INTERVAL:
         fps: float = frame_count / (now - last_log) if now != last_log else 0
@@ -262,6 +257,7 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
         for tid in stale_ids:
             tracked_zones.pop(tid, None)
             track_last_seen.pop(tid, None)
+            centroid_history.pop(tid, None)  # New cleanup
 
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
@@ -274,16 +270,17 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
         last_log = now
         frame_count = 0
 
-        # Handle date rollover at midnight
-        today: str = datetime.now().strftime("%Y-%m-%d")
-        if dailystats["date"] != today:
-            save_report()
-            dailystats["date"] = today
-            dailystats["entries"] = 0
-            dailystats["exits"] = 0
-            tracked_zones.clear()
-            track_last_seen.clear()
-            logger.info("New day started: %s", today)
+    # Handle date rollover at midnight
+    today: str = datetime.now().strftime("%Y-%m-%d")
+    if dailystats["date"] != today:
+        save_report()
+        dailystats["date"] = today
+        dailystats["entries"] = 0
+        dailystats["exits"] = 0
+        tracked_zones.clear()
+        track_last_seen.clear()
+        centroid_history.clear()
+        logger.info("New day started: %s", today)
 
     return Gst.FlowReturn.OK
 
