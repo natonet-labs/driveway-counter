@@ -201,26 +201,26 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             if len(history) >= 2:
                 prev_cx = history[-2]
                 vx = cx - prev_cx
+                zone_left = TRACKING_ZONE[0][0]   # 250
+                zone_right = TRACKING_ZONE[1][0]  # 490
+                in_zone = zone_left <= cx <= zone_right
+                was_in_zone = zone_left <= prev_cx <= zone_right
 
-                # ENTRY: crossed left zone edge (250) rightward
-                if prev_cx < TRACKING_ZONE[0][0] <= cx and vx > 3:
+                # Crossed INTO zone from left (rightward entry)
+                if not was_in_zone and in_zone and vx > 3:
                     if not track_state['entered']:
                         dailystats["entries"] += 1
                         track_state['entered'] = True
-                        logger.info(
-                            "➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                            vx, cx, label, track_id, confidence
-                        )
+                        logger.info("➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
+                                vx, cx, label, track_id, confidence)
 
-                # EXIT: crossed right zone edge (490) leftward
-                elif prev_cx > TRACKING_ZONE[1][0] >= cx and vx < -3:
+                # Crossed OUT OF zone to right (leftward exit)
+                elif was_in_zone and not in_zone and vx < -3:
                     if not track_state['exited']:
                         dailystats["exits"] += 1
                         track_state['exited'] = True
-                        logger.info(
-                            "➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
-                            vx, cx, label, track_id, confidence
-                        )
+                        logger.info("➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
+                                vx, cx, label, track_id, confidence)
 
             track_state['zone'] = 'in' if (TRACKING_ZONE[0][0] <= cx <= TRACKING_ZONE[1][0]) else 'out'
             tracked_zones[track_id] = track_state
