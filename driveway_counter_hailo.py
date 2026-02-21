@@ -146,6 +146,7 @@ def save_report() -> None:
         json.dump(dailystats, f, indent=2)
     logger.info("Report saved: %s", path)
 
+
 # ============================================================================
 # GStreamer Callback Functions
 # ============================================================================
@@ -163,6 +164,7 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
     buffer = sample.get_buffer()
     try:
         import hailo
+
         roi = hailo.get_roi_from_buffer(buffer)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
@@ -190,7 +192,11 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
 
             # Ensure persistent state
             if track_id not in tracked_zones:
-                tracked_zones[track_id] = {'zone': None, 'entered': False, 'exited': False}
+                tracked_zones[track_id] = {
+                    "zone": None,
+                    "entered": False,
+                    "exited": False,
+                }
             track_state = tracked_zones[track_id]
 
             # Centroid history (cx only for horizontal velocity)
@@ -201,35 +207,53 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             if len(history) >= 2:
                 prev_cx = history[-2]
                 vx = cx - prev_cx
+
                 zone_left = TRACKING_ZONE[0][0]
                 zone_right = TRACKING_ZONE[1][0]
-                in_zone = zone_left <= cx <= zone_right
-                was_in_zone = zone_left <= prev_cx <= zone_right
 
-                # Entered zone from left side (rightward)
-                if not was_in_zone and in_zone and vx > 3:
-                    if not track_state['entered']:
+                in_zone_now = zone_left <= cx <= zone_right
+                in_zone_prev = zone_left <= prev_cx <= zone_right
+
+                # ENTRY: came from left side and moved into zone
+                if (not in_zone_prev) and in_zone_now and vx > 2:
+                    if not track_state["entered"]:
                         dailystats["entries"] += 1
-                        track_state['entered'] = True
-                        logger.info("➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                                vx, cx, label, track_id, confidence)
+                        track_state["entered"] = True
+                        logger.info(
+                            "➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
+                            vx,
+                            cx,
+                            label,
+                            track_id,
+                            confidence,
+                        )
 
-                # Exited zone to right side (leftward)
-                elif was_in_zone and not in_zone and vx < -3:
-                    if not track_state['exited']:
+                # EXIT: came from inside zone and moved to left side (street view)
+                elif in_zone_prev and (not in_zone_now) and vx < -2:
+                    if not track_state["exited"]:
                         dailystats["exits"] += 1
-                        track_state['exited'] = True
-                        logger.info("➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
-                                vx, cx, label, track_id, confidence)
+                        track_state["exited"] = True
+                        logger.info(
+                            "➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
+                            vx,
+                            cx,
+                            label,
+                            track_id,
+                            confidence,
+                        )
 
-            track_state['zone'] = 'in' if (TRACKING_ZONE[0][0] <= cx <= TRACKING_ZONE[1][0]) else 'out'
+            track_state["zone"] = "in" if in_zone_now else "out"
             tracked_zones[track_id] = track_state
 
             if ISDEBUG:
                 logger.debug(
                     "Track %d %s@%.2f zone=%s cx=%d vx=%.1f",
-                    track_id, label, confidence, track_state['zone'],
-                    cx, (history[-1] - history[-2]) if len(history) >= 2 else 0
+                    track_id,
+                    label,
+                    confidence,
+                    track_state["zone"],
+                    cx,
+                    (history[-1] - history[-2]) if len(history) >= 2 else 0,
                 )
 
     except Exception as e:
@@ -242,7 +266,8 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
         fps: float = frame_count / (now - last_log) if now != last_log else 0
         now_dt: datetime = datetime.now()
         stale_ids: list[int] = [
-            tid for tid, last_seen in track_last_seen.items()
+            tid
+            for tid, last_seen in track_last_seen.items()
             if (now_dt - last_seen).total_seconds() > TRACK_TIMEOUT
         ]
         for tid in stale_ids:
@@ -252,7 +277,10 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
 
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
-            dailystats["entries"], dailystats["exits"], fps, len(tracked_zones)
+            dailystats["entries"],
+            dailystats["exits"],
+            fps,
+            len(tracked_zones),
         )
         last_log = now
         frame_count = 0
@@ -355,7 +383,13 @@ def main() -> int:
     """
     logger.info("🚗 Driveway Counter (Hailo 26 TOPS)")
     logger.info("📍 Zone: %s", TRACKING_ZONE.tolist())
-    logger.info("   ORIG_W x ORIG_H (%dx%d), IMG_W x IMG_H (%dx%d)", ORIG_W, ORIG_H, IMG_W, IMG_H)
+    logger.info(
+        "   ORIG_W x ORIG_H (%dx%d), IMG_W x IMG_H (%dx%d)",
+        ORIG_W,
+        ORIG_H,
+        IMG_W,
+        IMG_H,
+    )
 
     # Initialize GStreamer
     Gst.init(None)
@@ -371,14 +405,15 @@ def main() -> int:
     logger.info("✅ Model: %s", HEF_MODEL_PATH)
     logger.info("📈 CONF_THRESH=%.2f", CONF_THRESH)
 
-
     # Validate model file exists
     if not os.path.exists(HEF_MODEL_PATH):
         logger.error("HEF model not found: %s", HEF_MODEL_PATH)
         return 1
 
     # Build and create pipeline
-    pipeline_str: str = build_pipeline_string(rtsp_url, HEF_MODEL_PATH, IMG_W, IMG_H, SUBTYPE)
+    pipeline_str: str = build_pipeline_string(
+        rtsp_url, HEF_MODEL_PATH, IMG_W, IMG_H, SUBTYPE
+    )
 
     try:
         pipeline: Gst.Pipeline = Gst.parse_launch(pipeline_str)
