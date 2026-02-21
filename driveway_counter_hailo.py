@@ -527,33 +527,49 @@ def build_pipeline_string(
         )
 
     # Construct complete GStreamer pipeline string
-    # Build pipeline as a single string (no backslash line continuations in f-strings)
-    pipeline = (
-        f'rtspsrc location="{rtsp_url}" '
-        f"latency={RTSP_LATENCY_MS} buffer-mode=auto protocols=tcp "
-        f"drop-on-latency=true timeout={RTSP_TIMEOUT_US} name=src ! "
-        f"application/x-rtp,media=video ! {decoder} ! "
-        f"videoconvert ! video/x-raw,format=RGB ! "
-        f"videoscale ! video/x-raw,width={width},height={height} ! "
-        f"hailocropper name=cropper "
-        f"so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so "
-        f"function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true ! "
-        f"hailoaggregator name=agg ! queue ! "
-        f"hailotracker name=tracker class-id=-1 "
-        f"kalman-dist-thr={KALMAN_DIST_THR} iou-thr={IOU_THR} "
-        f"init-iou-thr={INIT_IOU_THR} "
-        f"keep-tracked-frames={KEEP_TRACKED_FRAMES} keep-lost-frames={KEEP_LOST_FRAMES} "
-        f"qos=false ! queue ! "
-        f"appsink name=sink emit-signals=true sync=false "
-        f"max-buffers={APPSINK_MAX_BUFFERS} drop={str(APPSINK_DROP_MODE).lower()} "
-        f"cropper. ! queue ! agg.sink_0 "
-        f"cropper. ! queue ! videoconvert ! "
-        f"hailonet hef-path={hef_path} batch-size={HAILO_BATCH_SIZE} ! "
-        f"hailofilter "
-        f"so-path=/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so "
-        f"config-path=/usr/local/hailo/resources/barcode_labels/coco_80.json "
-        f"function-name=filter qos=false ! agg.sink_1"
-    )
+    # Multi-branch structure: source→cropper splits into reference and inference paths,
+    # aggregated, then tracked and output to appsink
+    #
+    # Pipeline segments:
+    # 1. Source and preprocessing (RTSP → decode → scale → cropper)
+    # 2. Aggregator element (combines reference and detection paths)
+    # 3. Reference branch (cropper pad 0 → agg.sink_0)
+    # 4. Detection branch (cropper pad 1 → inference → agg.sink_1)
+    # 5. Output branch (agg → tracker → appsink)
+    parts = [
+        (
+            f'rtspsrc location="{rtsp_url}" '
+            f"latency={RTSP_LATENCY_MS} buffer-mode=auto protocols=tcp "
+            f"drop-on-latency=true timeout={RTSP_TIMEOUT_US} name=src ! "
+            f"application/x-rtp,media=video ! {decoder} ! "
+            f"videoconvert ! video/x-raw,format=RGB ! "
+            f"videoscale ! video/x-raw,width={width},height={height} ! "
+            f"hailocropper name=cropper "
+            f"so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so "
+            f"function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true"
+        ),
+        "hailoaggregator name=agg",
+        "cropper. ! queue ! agg.sink_0",
+        (
+            "cropper. ! queue ! videoconvert ! "
+            f"hailonet hef-path={hef_path} batch-size={HAILO_BATCH_SIZE} ! "
+            f"hailofilter "
+            f"so-path=/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so "
+            f"config-path=/usr/local/hailo/resources/barcode_labels/coco_80.json "
+            f"function-name=filter qos=false ! queue ! agg.sink_1"
+        ),
+        (
+            "agg. ! queue ! "
+            f"hailotracker name=tracker class-id=-1 "
+            f"kalman-dist-thr={KALMAN_DIST_THR} iou-thr={IOU_THR} "
+            f"init-iou-thr={INIT_IOU_THR} "
+            f"keep-tracked-frames={KEEP_TRACKED_FRAMES} keep-lost-frames={KEEP_LOST_FRAMES} "
+            f"qos=false ! queue ! "
+            f"appsink name=sink emit-signals=true sync=false "
+            f"max-buffers={APPSINK_MAX_BUFFERS} drop={str(APPSINK_DROP_MODE).lower()}"
+        ),
+    ]
+    pipeline = " ".join(parts)
     return pipeline
 
 
