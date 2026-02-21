@@ -206,7 +206,7 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                 in_zone = zone_left <= cx <= zone_right
                 was_in_zone = zone_left <= prev_cx <= zone_right
 
-                # Crossed INTO zone from left (rightward entry)
+                # Entered zone from left side (rightward)
                 if not was_in_zone and in_zone and vx > 3:
                     if not track_state['entered']:
                         dailystats["entries"] += 1
@@ -214,7 +214,7 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                         logger.info("➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
                                 vx, cx, label, track_id, confidence)
 
-                # Crossed OUT OF zone to right (leftward exit)
+                # Exited zone to right side (leftward)
                 elif was_in_zone and not in_zone and vx < -3:
                     if not track_state['exited']:
                         dailystats["exits"] += 1
