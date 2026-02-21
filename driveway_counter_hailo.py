@@ -309,7 +309,7 @@ config-path=/usr/local/hailo/resources/barcode_labels/coco_80.json \
 function-name=filter qos=false !
     queue ! agg.sink_1
     agg. ! queue !
-    hailotracker name=tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.6 \
+    hailotracker name=tracker class-id=-1 kalman-dist-thr=1 iou-thr=0.65 \
 init-iou-thr=0.7 keep-tracked-frames=10 keep-lost-frames=2 qos=false !
     queue !
     appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true
