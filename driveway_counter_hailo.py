@@ -201,8 +201,8 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             if len(history) >= 2:
                 prev_cx = history[-2]
                 vx = cx - prev_cx
-                zone_left = TRACKING_ZONE[0][0]   # 250
-                zone_right = TRACKING_ZONE[1][0]  # 490
+                zone_left = TRACKING_ZONE[0][0]
+                zone_right = TRACKING_ZONE[1][0]
                 in_zone = zone_left <= cx <= zone_right
                 was_in_zone = zone_left <= prev_cx <= zone_right
 
