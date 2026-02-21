@@ -360,7 +360,8 @@ def main() -> int:
     )
 
     logger.info("✅ Model: %s", HEF_MODEL_PATH)
-    logger.info("📈 CONF_THRESH=%.1f (low for %dx%d)", CONF_THRESH, IMG_W, IMG_H)
+    logger.info("📈 CONF_THRESH=%.2f (low for %dx%d)", CONF_THRESH, IMG_W, IMG_H)
+
 
     # Validate model file exists
     if not os.path.exists(HEF_MODEL_PATH):
