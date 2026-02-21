@@ -87,7 +87,7 @@ IMG_W=704
 IMG_H=480
 
 # Lower confidence for low-res
-CONF_THRESH=0.3
+CONF_THRESH=0.45
 
 # SINGLE TRACKING ZONE (top-left, top-right, bottom-right, bottom-left)
 TRACKING_ZONE=[[x,y],[x,y],[x,y],[x,y]]
@@ -192,15 +192,15 @@ python driveway_counter_hailo.py
 **Expected output:**
 ```
 [INFO] 🚗 Driveway Counter (Hailo 26 TOPS)
-[INFO] 📍 Zone: [[250, 10], [490, 10], [490, 460], [250, 460]] (scaled to 704x480)
+[INFO] 📍 Zone: [[380,3], [480,3], [480,460], [380,460]]
 [INFO] ✅ Model: ./models/yolov8m.hef
-[INFO] 📈 CONF_THRESH=0.3 (low for 704x480)
+[INFO] 📈 CONF_THRESH=0.45
 [INFO] 🚀 Starting pipeline...
-[INFO] ➡️ ENTER ZONE: person ID:3 conf=0.45
-[INFO] Entries=1 Exits=0 | FPS=15 | Tracks=1
-[INFO] ➡️ EXIT ZONE: person ID:3 conf=0.42
-[INFO] 📊 Entries=1 Exits=1 | FPS=15 | Tracks=0
-[INFO] 📊 Entries=1 Exits=1 | FPS=15 | Tracks=0
+[INFO] ➡️ ENTER ZONE (vx=16.0 cx=388): car ID:7362 conf=0.81
+[INFO] ➡️ EXIT ZONE (vx=70.0 cx=530):  car ID:7362 conf=0.60
+[INFO] ➡️ EXIT ZONE (vx=67.0 cx=543):  truck ID:7365 conf=0.60
+[INFO] ➡️ ENTER ZONE (vx=12.0 cx=387): car ID:7368 conf=0.81
+[INFO] ➡️ EXIT ZONE (vx=12.0 cx=484):  car ID:7368 conf=0.76
 ```
 
 **Stop with:** `Ctrl+C`
@@ -314,7 +314,7 @@ cat reports/driveway_$(date +%Y-%m-%d).json
 **Fixes:**
 ```bash
 # 1. Lower confidence threshold
-nano .env  # Set CONF_THRESH=0.3
+nano .env  # Set CONF_THRESH=0.45
 
 # 2. Verify hailo module
 python -c "import hailo; print(hailo.__file__)"
@@ -333,7 +333,7 @@ gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/real
 
 **Fix:** Verify pipeline includes:
 ```python
-hailotracker name=tracker class-id=-1 kalman-dist-thr=0.5 iou-thr=0.6 init-iou-thr=0.7 keep-tracked-frames=10 keep-lost-frames=2 !
+hailotracker name=tracker class-id=-1 kalman-dist-thr=1 iou-thr=0.65 init-iou-thr=0.7 keep-tracked-frames=10 keep-lost-frames=2 !
 ```
 
 ---
@@ -462,7 +462,7 @@ Update the Zone Configuration section for better formatting. Zones are defined i
 **Example for low-res stream (704x480):**
 
 ```bash
-TRACKING_ZONE=[[250,10],[490,10],[490,460],[250,460]]
+TRACKING_ZONE=[[380,3],[480,3],[480,460],[380,460]]
 ```
 
 **Visual representation:**
@@ -558,7 +558,6 @@ python driveway_counter_hailo.py
 
 ---
 
-**Last Updated:** 2026-02-16
 **Tested On:** Raspberry Pi 5 + Hailo AI HAT+ (26 TOPS) + Lorex 4K RTSP Camera
 
 **Key Improvements:**

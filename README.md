@@ -14,7 +14,7 @@ Turn your Raspberry Pi 5 into a high-performance AI security camera with this si
 - Hailo AI HAT acceleration (90+ inferences/sec) eliminates GPU dependency
 - Unique ID tracking prevents double-counting across frame boundaries
 - Configurable polygon zones via live web interface-no manual coordinate math
-- Midnight JSON reports for automated analysis (vehicles: +3/-2, people: +1, pets: +4)
+- Midnight JSON reports:  {"date": "2026-02-21", "entries": 333, "exits": 317}  — tracks all 80 COCO classes
 - Perfect for home labs wanting production-grade computer vision without cloud dependency or complex multi-container setups. Deployable as systemd service for 24/7 operation.
 
 ## Features

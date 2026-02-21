@@ -54,7 +54,7 @@ IMG_W: int = int(os.getenv("IMG_W", "704"))
 IMG_H: int = int(os.getenv("IMG_H", "480"))
 
 # Detection Settings
-CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.3"))
+CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.45"))
 
 # ============================================================================
 # Zone Configuration
@@ -82,7 +82,7 @@ def _parse_zone(env_var: str, default: str) -> np.ndarray:
 
 # Single tracking zone (covers driveway centerline)
 TRACKING_ZONE: np.ndarray = _parse_zone(
-    "TRACKING_ZONE", "[[250,10],[490,10],[490,460],[250,460]]"
+    "TRACKING_ZONE", "[[380,3],[480,3],[480,460],[380,460]]"
 )
 
 # Scale zone to processing resolution
