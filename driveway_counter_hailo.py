@@ -354,7 +354,8 @@ def main() -> int:
         int: Exit code (0 for success, 1 for error)
     """
     logger.info("🚗 Driveway Counter (Hailo 26 TOPS)")
-    logger.info("📍 Zone: %s (scaled to %dx%d)", TRACKING_ZONE.tolist(), IMG_W, IMG_H)
+    logger.info("📍 Zone: %s", TRACKING_ZONE.tolist())
+    logger.info("ORIG_W x ORIG_H (%dx%d), IMG_W x IMG_H (%dx%d)", ORIG_W, ORIG_H, IMG_W, IMG_H)
 
     # Initialize GStreamer
     Gst.init(None)
