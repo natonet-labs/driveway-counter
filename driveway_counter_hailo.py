@@ -152,7 +152,7 @@ def save_report() -> None:
 
 
 def on_new_sample(sink: Any) -> Gst.FlowReturn:
-    """Process detections: count zone crossings by direction (robust per-track)."""
+    """Process detections: count zone crossings by edge detection (bidirectional)."""
     global dailystats, frame_count, last_log, tracked_zones, track_last_seen, centroid_history
 
     sample = sink.emit("pull-sample")
@@ -186,52 +186,57 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             if not (0 <= cx < IMG_W and 0 <= cy < IMG_H):
                 continue
 
-            in_zone: bool = tracking_mask[cy, cx] > 0
             track_last_seen[track_id] = datetime.now()
 
-            # ENSURE PERSISTENT STATE (fix)
+            # Ensure persistent state
             if track_id not in tracked_zones:
                 tracked_zones[track_id] = {'zone': None, 'entered': False, 'exited': False}
             track_state = tracked_zones[track_id]
 
-            # Velocity history
-            history = centroid_history.get(track_id, deque(maxlen=3))
-            history.append((cx, cy))
+            # Centroid history (cx only for horizontal velocity)
+            history = centroid_history.get(track_id, deque(maxlen=5))
+            history.append(cx)
             centroid_history[track_id] = history
 
-            vx = 0
             if len(history) >= 2:
-                prev_cx, _ = history[-2]
+                prev_cx = history[-2]
                 vx = cx - prev_cx
 
-            # CROSS-DIRECTION LOGIC (your replacement)
-            cross_dir = None
-            if in_zone and vx > 5:  # Rightward in zone: entry
-                cross_dir = 'entry'
-            elif not in_zone and vx < -5:  # Leftward out zone: exit
-                cross_dir = 'exit'
+                # ENTRY: crossed left zone edge (250) rightward
+                if prev_cx < TRACKING_ZONE[0][0] <= cx and vx > 3:
+                    if not track_state['entered']:
+                        dailystats["entries"] += 1
+                        track_state['entered'] = True
+                        logger.info(
+                            "➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
+                            vx, cx, label, track_id, confidence
+                        )
 
-            if cross_dir == 'entry' and not track_state['entered']:
-                dailystats["entries"] += 1
-                track_state['entered'] = True
-                logger.info("➡️ ENTER ZONE (vx=%.1f): %s ID:%d conf=%.2f", vx, label, track_id, confidence)
-            elif cross_dir == 'exit' and not track_state['exited']:
-                dailystats["exits"] += 1
-                track_state['exited'] = True
-                logger.info("➡️ EXIT ZONE (vx=%.1f):  %s ID:%d conf=%.2f", vx, label, track_id, confidence)
+                # EXIT: crossed right zone edge (490) leftward
+                elif prev_cx > TRACKING_ZONE[1][0] >= cx and vx < -3:
+                    if not track_state['exited']:
+                        dailystats["exits"] += 1
+                        track_state['exited'] = True
+                        logger.info(
+                            "➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
+                            vx, cx, label, track_id, confidence
+                        )
 
-            track_state['zone'] = 'in' if in_zone else 'out'
-            tracked_zones[track_id] = track_state  # COMMIT
+            track_state['zone'] = 'in' if (TRACKING_ZONE[0][0] <= cx <= TRACKING_ZONE[1][0]) else 'out'
+            tracked_zones[track_id] = track_state
 
             if ISDEBUG:
-                logger.debug("Track %d %s@%.2f zone=%s pos=(%d,%d) vx=%.1f", track_id, label, confidence, 
-                           track_state['zone'], cx, cy, vx)
+                logger.debug(
+                    "Track %d %s@%.2f zone=%s cx=%d vx=%.1f",
+                    track_id, label, confidence, track_state['zone'],
+                    cx, (history[-1] - history[-2]) if len(history) >= 2 else 0
+                )
 
     except Exception as e:
         if ISDEBUG:
             logger.exception("Detection error: %s", e)
 
-    # Stats + cleanup (unchanged)
+    # Stats + stale cleanup
     now: float = datetime.now().timestamp()
     if now - last_log >= STATS_LOG_INTERVAL:
         fps: float = frame_count / (now - last_log) if now != last_log else 0
@@ -245,11 +250,14 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
             track_last_seen.pop(tid, None)
             centroid_history.pop(tid, None)
 
-        logger.info("📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d", 
-                   dailystats["entries"], dailystats["exits"], fps, len(tracked_zones))
+        logger.info(
+            "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
+            dailystats["entries"], dailystats["exits"], fps, len(tracked_zones)
+        )
         last_log = now
         frame_count = 0
 
+    # Date rollover
     today: str = datetime.now().strftime("%Y-%m-%d")
     if dailystats["date"] != today:
         save_report()
