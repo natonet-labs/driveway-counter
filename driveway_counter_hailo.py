@@ -214,8 +214,8 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                 in_zone_now = zone_left <= cx <= zone_right
                 in_zone_prev = zone_left <= prev_cx <= zone_right
 
-                # ENTRY: came from left side and moved into zone
-                if (not in_zone_prev) and in_zone_now and vx > 2:
+                # ENTRY: crossed left edge rightward (left→right traffic)
+                if not in_zone_prev and in_zone_now and vx > 2:
                     if not track_state["entered"]:
                         dailystats["entries"] += 1
                         track_state["entered"] = True
@@ -228,13 +228,41 @@ def on_new_sample(sink: Any) -> Gst.FlowReturn:
                             confidence,
                         )
 
-                # EXIT: came from inside zone and moved to left side (street view)
-                elif in_zone_prev and (not in_zone_now) and vx < -2:
+                # EXIT RIGHT: crossed right edge rightward (left→right traffic exiting)
+                elif in_zone_prev and not in_zone_now and vx > 2:
                     if not track_state["exited"]:
                         dailystats["exits"] += 1
                         track_state["exited"] = True
                         logger.info(
                             "➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
+                            vx,
+                            cx,
+                            label,
+                            track_id,
+                            confidence,
+                        )
+
+                # EXIT LEFT: crossed left edge leftward (right→left traffic exiting)
+                elif in_zone_prev and not in_zone_now and vx < -2:
+                    if not track_state["exited"]:
+                        dailystats["exits"] += 1
+                        track_state["exited"] = True
+                        logger.info(
+                            "➡️ EXIT ZONE (vx=%.1f cx=%d):  %s ID:%d conf=%.2f",
+                            vx,
+                            cx,
+                            label,
+                            track_id,
+                            confidence,
+                        )
+
+                # ENTRY RIGHT: crossed right edge leftward (right→left traffic entering)
+                elif not in_zone_prev and in_zone_now and vx < -2:
+                    if not track_state["entered"]:
+                        dailystats["entries"] += 1
+                        track_state["entered"] = True
+                        logger.info(
+                            "➡️ ENTER ZONE (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
                             vx,
                             cx,
                             label,
