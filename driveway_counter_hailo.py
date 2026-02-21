@@ -355,7 +355,7 @@ def main() -> int:
     """
     logger.info("🚗 Driveway Counter (Hailo 26 TOPS)")
     logger.info("📍 Zone: %s", TRACKING_ZONE.tolist())
-    logger.info("ORIG_W x ORIG_H (%dx%d), IMG_W x IMG_H (%dx%d)", ORIG_W, ORIG_H, IMG_W, IMG_H)
+    logger.info("🖼️ ORIG_W x ORIG_H (%dx%d), IMG_W x IMG_H (%dx%d)", ORIG_W, ORIG_H, IMG_W, IMG_H)
 
     # Initialize GStreamer
     Gst.init(None)
@@ -369,7 +369,7 @@ def main() -> int:
     )
 
     logger.info("✅ Model: %s", HEF_MODEL_PATH)
-    logger.info("📈 CONF_THRESH=%.2f (low for %dx%d)", CONF_THRESH, IMG_W, IMG_H)
+    logger.info("📈 CONF_THRESH=%.2f", CONF_THRESH)
 
 
     # Validate model file exists
