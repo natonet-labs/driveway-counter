@@ -26,7 +26,7 @@ import json
 import logging
 import os
 from collections import deque
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 from urllib.parse import quote
 
@@ -38,13 +38,13 @@ from dotenv import load_dotenv
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib  # noqa: E402
 
-__all__ = [
-    "build_pipeline_string",
-    "on_bus_message",
-    "process_frame_detections",
-    "save_report",
-    "main",
-]
+try:
+    import hailo
+except ImportError as e:
+    raise SystemExit(
+        f"Hailo Python module not found. "
+        f"Ensure venv uses --system-site-packages. Error: {e}"
+    )
 
 # Load environment variables
 load_dotenv()
@@ -147,7 +147,7 @@ def _parse_zone(env_var: str, default: str) -> np.ndarray:
     try:
         pts = ast.literal_eval(val)
     except (ValueError, SyntaxError) as e:
-        logger.warning(f"Invalid {env_var} format: {e}, using default")
+        logger.warning("Invalid %s format: %s, using default", env_var, e)
         pts = ast.literal_eval(default)
     return np.array(pts, dtype=np.int32)
 
@@ -155,7 +155,7 @@ def _parse_zone(env_var: str, default: str) -> np.ndarray:
 # Single tracking zone (covers driveway centerline) in ORIGINAL resolution
 TRACKING_ZONE_ORIG: np.ndarray = _parse_zone(
     "TRACKING_ZONE",
-    "[[380,3],[480,3],[480,460],[380,460]]",
+    "[[100,10],[600,10],[600,460],[100,460]]",
 )
 
 # Scale zone from original to processing resolution
@@ -197,7 +197,7 @@ centroid_history: dict[int, deque[tuple[int, int]]] = {}
 track_last_seen: dict[int, datetime] = {}
 
 # Daily statistics accumulator
-dailystats: dict[str, Any] = {
+daily_stats: dict[str, Any] = {
     "date": datetime.now().strftime("%Y-%m-%d"),
     "entries": 0,
     "exits": 0,
@@ -205,7 +205,7 @@ dailystats: dict[str, Any] = {
 
 # Frame processing metrics
 frame_count: int = 0
-last_log: float = datetime.now().timestamp()
+last_log: float = time.monotonic()
 
 # ============================================================================
 # Utility Functions
@@ -215,7 +215,7 @@ last_log: float = datetime.now().timestamp()
 def save_report() -> None:
     """Save daily statistics to JSON report file.
 
-    Writes the current dailystats dictionary to a JSON file with a filename
+    Writes the current daily_stats dictionary to a JSON file with a filename
     based on the current date. Reports are saved to REPORT_DIR directory.
 
     File naming: driveway_YYYY-MM-DD.json
@@ -226,13 +226,13 @@ def save_report() -> None:
     Raises:
         OSError: If file write fails
     """
-    path = f"{REPORT_DIR}/driveway_{dailystats['date']}.json"
+    path = f"{REPORT_DIR}/driveway_{daily_stats['date']}.json"
     try:
         with open(path, "w") as f:
-            json.dump(dailystats, f, indent=2)
+            json.dump(daily_stats, f, indent=2)
         logger.info("Report saved: %s", path)
     except OSError as e:
-        logger.error(f"Failed to save report to {path}: {e}")
+        logger.error("Failed to save report to %s: %s", path, e)
 
 
 # ============================================================================
@@ -265,8 +265,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
     Returns:
         Gst.FlowReturn: OK on successful processing, OK on error to continue
     """
-    global dailystats, frame_count, last_log
-    global tracked_zones, track_last_seen, centroid_history
+    global daily_stats, frame_count, last_log
 
     sample = sink.emit("pull-sample")
     if sample is None:
@@ -276,8 +275,6 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
     buffer = sample.get_buffer()
 
     try:
-        import hailo
-
         roi = hailo.get_roi_from_buffer(buffer)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
@@ -343,7 +340,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
                 # ENTRY: Crossed left boundary rightward (left→right entry)
                 if not in_zone_prev and in_zone_now and velocity_x > VELOCITY_THRESHOLD:
                     if not track_state["entered"]:
-                        dailystats["entries"] += 1
+                        daily_stats["entries"] += 1
                         track_state["entered"] = True
                         logger.info(
                             "➡️ ENTRY (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
@@ -359,7 +356,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
                     in_zone_prev and not in_zone_now and velocity_x > VELOCITY_THRESHOLD
                 ):
                     if not track_state["exited"]:
-                        dailystats["exits"] += 1
+                        daily_stats["exits"] += 1
                         track_state["exited"] = True
                         logger.info(
                             "➡️ EXIT (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
@@ -377,7 +374,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
                     and velocity_x < -VELOCITY_THRESHOLD
                 ):
                     if not track_state["exited"]:
-                        dailystats["exits"] += 1
+                        daily_stats["exits"] += 1
                         track_state["exited"] = True
                         logger.info(
                             "➡️ EXIT (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
@@ -395,7 +392,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
                     and velocity_x < -VELOCITY_THRESHOLD
                 ):
                     if not track_state["entered"]:
-                        dailystats["entries"] += 1
+                        daily_stats["entries"] += 1
                         track_state["entered"] = True
                         logger.info(
                             "➡️ ENTRY (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
@@ -450,8 +447,8 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
         # Log statistics
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
-            dailystats["entries"],
-            dailystats["exits"],
+            daily_stats["entries"],
+            daily_stats["exits"],
             fps,
             len(tracked_zones),
         )
@@ -460,11 +457,11 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
 
     # Check for date rollover (midnight)
     today: str = datetime.now().strftime("%Y-%m-%d")
-    if dailystats["date"] != today:
+    if daily_stats["date"] != today:
         save_report()
-        dailystats["date"] = today
-        dailystats["entries"] = 0
-        dailystats["exits"] = 0
+        daily_stats["date"] = today
+        daily_stats["entries"] = 0
+        daily_stats["exits"] = 0
         tracked_zones.clear()
         track_last_seen.clear()
         centroid_history.clear()
@@ -647,7 +644,7 @@ def main() -> int:
     try:
         Gst.init(None)
     except Exception as e:
-        logger.error(f"Failed to initialize GStreamer: {e}")
+        logger.error("Failed to initialize GStreamer: %s", e)
         return 1
 
     # Build RTSP URL with URL-encoded credentials (security: no plaintext in logs)
@@ -669,10 +666,11 @@ def main() -> int:
 
     # Validate model file exists before pipeline creation
     if not os.path.exists(HEF_MODEL_PATH):
-        logger.error(f"❌ HEF model not found: {HEF_MODEL_PATH}")
+        logger.error("❌ HEF model not found: %s", HEF_MODEL_PATH)
         return 1
 
     # Build GStreamer pipeline from configuration
+    pipeline: Gst.Pipeline | None = None
     try:
         pipeline_str: str = build_pipeline_string(
             rtsp_url,
@@ -684,7 +682,7 @@ def main() -> int:
         pipeline: Gst.Pipeline = Gst.parse_launch(pipeline_str)
         logger.debug("Pipeline created successfully")
     except Exception as e:
-        logger.error(f"❌ Pipeline creation failed: {e}")
+        logger.error("❌ Pipeline creation failed: %s", e)
         if IS_DEBUG:
             logger.exception("Full traceback:")
         return 1
@@ -698,7 +696,7 @@ def main() -> int:
         sink.connect("new-sample", process_frame_detections)
         logger.debug("Connected sample callback to appsink")
     except Exception as e:
-        logger.error(f"❌ Failed to connect callback: {e}")
+        logger.error("❌ Failed to connect callback: %s", e)
         return 1
 
     # Set up GStreamer bus for error/EOS handling
@@ -724,7 +722,7 @@ def main() -> int:
             return 1
         logger.info("✅ Pipeline running, processing frames...")
     except Exception as e:
-        logger.error(f"❌ Pipeline start failed: {e}")
+        logger.error("❌ Pipeline start failed: %s", e)
         return 1
 
     # Run main event loop (blocks until quit signal or error)
@@ -734,17 +732,14 @@ def main() -> int:
         logger.info("⊛ Keyboard interrupt (CTRL+C) received")
         return 0
     except Exception as e:
-        logger.error(f"❌ Main loop error: {e}")
+        logger.error("❌ Main loop error: %s", e)
         if IS_DEBUG:
             logger.exception("Full traceback:")
         return 1
     finally:
         # Guaranteed cleanup on any exit path
-        try:
+        if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
-            logger.debug("Pipeline stopped (state=NULL)")
-        except Exception as e:
-            logger.warning(f"Error stopping pipeline: {e}")
 
         # Save final statistics report
         save_report()
