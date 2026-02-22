@@ -516,7 +516,7 @@ def main() -> int:
             port=FLASK_PORT,
             debug=False,
             threaded=True,
-            ssl="adhoc",
+            ssl_context="adhoc",
         )
 
         return 0
