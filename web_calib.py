@@ -6,7 +6,11 @@ with an overlaid single tracking zone polygon for calibration purposes.
 
 The application connects to an RTSP camera using environment variables from .env,
 streams live video frames with zone overlay visualization, and provides a web
-interface on http://localhost:8081 for real-time calibration and configuration.
+interface on https://localhost:8081 for real-time calibration and configuration.
+
+Note: Browsers auto-upgrade local network connections to HTTPS, so SSL support
+is enabled with self-signed certificates. Accept the certificate warning when
+first accessing the interface.
 
 Environment Variables (.env):
     USERNAME: Camera username
@@ -501,13 +505,18 @@ def main() -> int:
         initialize_video_capture()
         log_zone_config()
 
-        # Start Flask web server
-        print(f"Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
+        # Start Flask web server with SSL support
+        # Browser auto-upgrades local connections to HTTPS, so SSL is required
+        print(f"Starting Flask server on https://{FLASK_HOST}:{FLASK_PORT}")
+        print(
+            "📝 Note: Self-signed certificate. Accept the security warning in your browser."
+        )
         app.run(
             host=FLASK_HOST,
             port=FLASK_PORT,
             debug=False,
             threaded=True,
+            ssl="adhoc",
         )
 
         return 0

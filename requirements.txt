@@ -4,11 +4,19 @@
 # Environment configuration
 python-dotenv>=1.0.0
 
+# Web framework with SSL support for local calibration
+# Required: browsers auto-upgrade HTTP to HTTPS on local networks
+Flask>=2.3.0
+pyopenssl>=24.0.0
+
 # Computer vision
 opencv-python==4.11.0.86
 
 # Numerical computing (pinned for Hailo compatibility)
 numpy==1.26.4
+
+# Note: GStreamer (gi) and Hailo Python bindings come from system packages
+# Create venv with: python3 -m venv .venv --system-site-packages
 
 # Note: GStreamer (gi) and Hailo Python bindings come from system packages
 # Create venv with: python3 -m venv .venv --system-site-packages
