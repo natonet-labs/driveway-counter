@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Web Calibration Tool - Single Zone Visualization.
+"""
+Web Calibration Tool - Single Zone Visualization.
 
-This Flask web application displays a live video stream from an RTSP camera
-with an overlaid single tracking zone polygon for calibration.
+A Flask web application that displays a live RTSP video stream
+with an overlaid tracking zone polygon for coordinate calibration.
 
-Environment variables (.env):
-    USERNAME: Camera username
-    PASSWORD: Camera password
-    IPADDRESS: Camera IP address
-    CHANNEL: Camera channel (default: 1)
-    SUBTYPE: RTSP stream subtype (0=main, 1=substream)
-    ORIG_W: Original camera width (e.g. 704 or 1920)
-    ORIG_H: Original camera height (e.g. 480 or 1080)
-    TRACKING_ZONE: Tracking zone polygon in ORIGINAL resolution coordinates
-                   e.g. [[100,50],[600,50],[600,430],[100,430]]
+Usage:
+    python web_calib.py
+    Open http://rpi.local:8081       — calibration UI
+    Open http://rpi.local:8081/video — raw MJPEG stream
+
+Environment variables (via .env):
+    USERNAME      Camera username
+    PASSWORD      Camera password
+    IP_ADDRESS    Camera IP address
+    CHANNEL       Camera channel (default: 1)
+    SUBTYPE       RTSP subtype (0=main, 1=substream)
+    ORIG_W        Original camera width (e.g. 704)
+    ORIG_H        Original camera height (e.g. 480)
+    TRACKING_ZONE Zone polygon in original resolution coords
+                  e.g. [[380,3],[480,3],[480,460],[380,460]]
 """
 
+from __future__ import annotations
+
+import ast
+import logging
 import os
 import time
 from typing import Generator, Optional, Tuple
@@ -25,297 +35,276 @@ import numpy as np
 from dotenv import load_dotenv
 from flask import Flask, Response
 
-# Configure OpenCV logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Suppress noisy OpenCV/FFmpeg output
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "loglevel;error"
 
-# Load environment variables
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 load_dotenv()
 
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-# RTSP Camera Connection Settings
 USERNAME: str = os.getenv("USERNAME", "")
 PASSWORD: str = os.getenv("PASSWORD", "")
-IPADDRESS: str = os.getenv("IPADDRESS", "")
+IP_ADDRESS: str = os.getenv("IP_ADDRESS", "")
 CHANNEL: str = os.getenv("CHANNEL", "1")
 SUBTYPE: str = os.getenv("SUBTYPE", "0")
 
+ORIG_W: int = int(os.getenv("ORIG_W", 704))
+ORIG_H: int = int(os.getenv("ORIG_H", 480))
+
+FLASK_HOST: str = "0.0.0.0"
+FLASK_PORT: int = int(os.getenv("FLASK_PORT", 8081))
+
 RTSP_URL: str = (
-    f"rtsp://{USERNAME}:{PASSWORD}@{IPADDRESS}:554"
+    f"rtsp://{USERNAME}:{PASSWORD}@{IP_ADDRESS}:554"
     f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
 )
 
-# Original resolution from .env (used for zone coordinates)
-ORIG_W: int = int(os.getenv("ORIG_W", "3840"))
-ORIG_H: int = int(os.getenv("ORIG_H", "2160"))
+# ---------------------------------------------------------------------------
+# Zone Configuration
+# ---------------------------------------------------------------------------
+_DEFAULT_ZONE = "[[100,50],[600,50],[600,430],[100,430]]"
+_zone_raw: str = os.getenv("TRACKING_ZONE", _DEFAULT_ZONE)
 
-# Single Zone Definition (in ORIGINAL resolution)
-TRACKING_ZONE_STR: str = os.getenv(
-    "TRACKING_ZONE",
-    # Default: wide rectangle for 704x480, will scale for other resolutions
-    "[[100,50],[600,50],[600,430],[100,430]]",
-)
-TRACKING_ZONE_ORIG: np.ndarray = np.array(eval(TRACKING_ZONE_STR), dtype=np.int32)
+try:
+    TRACKING_ZONE_ORIG: np.ndarray = np.array(
+        ast.literal_eval(_zone_raw), dtype=np.int32
+    )
+except (ValueError, SyntaxError):
+    logger.warning("Invalid TRACKING_ZONE, using default: %s", _DEFAULT_ZONE)
+    TRACKING_ZONE_ORIG = np.array(ast.literal_eval(_DEFAULT_ZONE), dtype=np.int32)
 
-# Visualization Settings (BGR format)
-ZONE_COLOR: Tuple[int, int, int] = (0, 255, 255)  # Yellow
-TEXT_COLOR: Tuple[int, int, int] = (255, 255, 255)  # White
+# ---------------------------------------------------------------------------
+# Visualization Constants
+# ---------------------------------------------------------------------------
+ZONE_COLOR: Tuple[int, int, int] = (0, 255, 255)  # Yellow (BGR)
+TEXT_COLOR: Tuple[int, int, int] = (255, 255, 255)  # White (BGR)
 BORDER_THICKNESS: int = 3
-FONT_SIZE: float = 1.0
+FONT_SCALE: float = 1.0
+FONT_FACE: int = cv2.FONT_HERSHEY_SIMPLEX
+JPEG_QUALITY: int = 85
+MAX_CONSECUTIVE_FAILURES: int = 50
 
-# Flask Application Settings
-FLASK_HOST: str = "0.0.0.0"
-FLASK_PORT: int = 8081
-
-# ============================================================================
-# Global State
-# ============================================================================
-
+# ---------------------------------------------------------------------------
+# Video Capture
+# ---------------------------------------------------------------------------
 cap: Optional[cv2.VideoCapture] = None
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
 
 
 def initialize_video_capture() -> cv2.VideoCapture:
-    """Initialize video capture from RTSP stream.
+    """Initialize RTSP video capture with optimized settings.
 
     Returns:
-        cv2.VideoCapture: Video capture object
+        cv2.VideoCapture: Opened capture object.
 
     Raises:
-        RuntimeError: If RTSP connection fails
+        RuntimeError: If RTSP connection cannot be established.
     """
     global cap
-    print(
-        f"🔗 Connecting RTSP: rtsp://{USERNAME}:****@{IPADDRESS}:{CHANNEL}/{SUBTYPE}..."
+    logger.info(
+        "Connecting to RTSP rtsp://%s@%s channel=%s subtype=%s ...",
+        USERNAME,
+        IP_ADDRESS,
+        CHANNEL,
+        SUBTYPE,
     )
-
     cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-
-    # RTSP optimizations
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffering
-    cap.set(cv2.CAP_PROP_FPS, 15)  # Target FPS
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 704)  # Match substream
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # FFmpeg RTSP params (robust)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 15)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, ORIG_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ORIG_H)
     cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
     cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
 
     if not cap.isOpened():
-        raise RuntimeError(f"❌ RTSP failed: {RTSP_URL}")
+        raise RuntimeError(f"RTSP connection failed: {RTSP_URL}")
 
-    print("✅ RTSP connected (buff=1, timeout=1s)")
+    logger.info("RTSP connected (buffer=1, timeout=1s)")
     return cap
 
 
-def log_zone_config() -> None:
-    """Log the current zone configuration."""
-    print(f"Original resolution (ORIG_WxORIG_H): {ORIG_W}x{ORIG_H}")
-    print(f"Tracking Zone (ORIGINAL coords): {TRACKING_ZONE_STR}")
-
-
-def clip_zone_to_frame(
-    zone: np.ndarray, frame_width: int, frame_height: int
+# ---------------------------------------------------------------------------
+# Zone Utilities
+# ---------------------------------------------------------------------------
+def scale_zone_to_frame(
+    zone_orig: np.ndarray, frame_w: int, frame_h: int
 ) -> np.ndarray:
+    """Scale zone from original resolution to current frame resolution.
+
+    Args:
+        zone_orig: Zone polygon in original camera resolution.
+        frame_w:   Target frame width in pixels.
+        frame_h:   Target frame height in pixels.
+
+    Returns:
+        np.ndarray: Scaled zone coordinates.
+    """
+    if ORIG_W == 0 or ORIG_H == 0:
+        return zone_orig.copy()
+    scale = np.array([frame_w / ORIG_W, frame_h / ORIG_H], dtype=np.float32)
+    return (zone_orig * scale).astype(np.int32)
+
+
+def clip_zone_to_frame(zone: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray:
     """Clip zone coordinates to frame boundaries.
 
     Args:
-        zone: Zone polygon as numpy array
-        frame_width: Frame width in pixels
-        frame_height: Frame height in pixels
+        zone:    Zone polygon as numpy array.
+        frame_w: Frame width in pixels.
+        frame_h: Frame height in pixels.
 
     Returns:
-        np.ndarray: Clipped zone coordinates
+        np.ndarray: Clipped zone coordinates.
     """
     clipped = zone.copy()
-    clipped[:, 0] = np.clip(clipped[:, 0], 0, frame_width - 1)
-    clipped[:, 1] = np.clip(clipped[:, 1], 0, frame_height - 1)
+    clipped[:, 0] = np.clip(clipped[:, 0], 0, frame_w - 1)
+    clipped[:, 1] = np.clip(clipped[:, 1], 0, frame_h - 1)
     return clipped
 
 
-def scale_zone_to_frame(
-    zone_orig: np.ndarray, frame_width: int, frame_height: int
-) -> np.ndarray:
-    """Scale zone from ORIGINAL resolution to current frame resolution.
+def draw_zone_on_frame(frame: np.ndarray) -> np.ndarray:
+    """Draw tracking zone polygon and resolution label on frame.
 
     Args:
-        zone_orig: Zone polygon in original resolution
-        frame_width: Target frame width in pixels
-        frame_height: Target frame height in pixels
+        frame: Input BGR video frame.
 
     Returns:
-        np.ndarray: Scaled zone coordinates
-    """
-    if ORIG_W <= 0 or ORIG_H <= 0:
-        return zone_orig.copy()
-    scale_x = frame_width / ORIG_W
-    scale_y = frame_height / ORIG_H
-    scaled = zone_orig * np.array([scale_x, scale_y], dtype=np.float32)
-    return scaled.astype(np.int32)
-
-
-def draw_zone_on_frame(frame: np.ndarray, zone_orig: np.ndarray) -> np.ndarray:
-    """Draw single tracking zone on frame.
-
-    Args:
-        frame: Input video frame
-        zone_orig: Zone polygon in original resolution
-
-    Returns:
-        np.ndarray: Frame with zone drawn
+        np.ndarray: Frame with zone overlay.
     """
     h, w = frame.shape[:2]
-
-    # Scale and clip to frame
-    zone_scaled = scale_zone_to_frame(zone_orig, w, h)
+    zone_scaled = scale_zone_to_frame(TRACKING_ZONE_ORIG, w, h)
     zone_clipped = clip_zone_to_frame(zone_scaled, w, h)
 
-    # Draw polygon
     cv2.polylines(frame, [zone_clipped], True, ZONE_COLOR, BORDER_THICKNESS)
-
-    # Label + resolution
-    cv2.putText(
-        frame,
-        f"{w}x{h}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        FONT_SIZE,
-        TEXT_COLOR,
-        2,
-    )
-    cv2.putText(
-        frame,
-        "Tracking Zone",
-        (10, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        FONT_SIZE,
-        ZONE_COLOR,
-        2,
-    )
-
+    cv2.putText(frame, f"{w}x{h}", (10, 30), FONT_FACE, FONT_SCALE, TEXT_COLOR, 2)
+    cv2.putText(frame, "Tracking Zone", (10, 60), FONT_FACE, FONT_SCALE, ZONE_COLOR, 2)
     return frame
 
 
+# ---------------------------------------------------------------------------
+# MJPEG Stream Generator
+# ---------------------------------------------------------------------------
 def gen_frames() -> Generator[bytes, None, None]:
-    """Generate video frames for streaming.
+    """Generate MJPEG frames for Flask streaming route.
 
     Yields:
-        bytes: MJPEG frame data with boundary markers
+        bytes: MJPEG frame with multipart boundary headers.
     """
     global cap
-
     consecutive_failures = 0
-    max_failures = 50
 
     while True:
         ret, frame = cap.read()
+
         if not ret:
             consecutive_failures += 1
             if consecutive_failures % 10 == 0:
-                print(f"⚠️ Frame drop #{consecutive_failures}")
-            if consecutive_failures > max_failures:
-                print("🔄 Reconnecting RTSP...")
+                logger.warning("Frame drop #%d", consecutive_failures)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.warning("Reconnecting RTSP...")
                 cap.release()
                 time.sleep(1)
-                cap = initialize_video_capture()  # Now safe
+                cap = initialize_video_capture()
                 consecutive_failures = 0
             continue
 
         consecutive_failures = 0
+        frame = draw_zone_on_frame(frame)
 
-        # Draw single zone
-        frame = draw_zone_on_frame(frame, TRACKING_ZONE_ORIG)
-
-        # JPEG (quality 85 for speed)
-        ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        ret, buffer = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+        )
         if not ret:
             continue
 
         yield (
-            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
         )
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # Flask Application
-# ============================================================================
-
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-HTML_TEMPLATE: str = """
-<html>
-  <head>
-    <title>Driveway Single Zone Calibration</title>
-    <style>
-      body { background-color: #222; color: #eee; font-family: sans-serif; text-align: center; }
-      h1 { margin-top: 20px; }
-      img { border: 2px solid #555; margin-top: 20px; }
-      .note { margin-top: 10px; font-size: 0.9em; color: #ccc; }
-    </style>
-  </head>
-  <body>
-    <h1>Driveway Single Zone Calibration</h1>
-    <p class="note">
-      Yellow polygon = TRACKING_ZONE (from .env, ORIGINAL resolution, scaled to stream).
-    </p>
-    <img src="/video" />
-  </body>
-</html>
-"""
+_HTML_TEMPLATE: str = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Driveway Zone Calibration</title>
+  <style>
+    body {{ background:#222; color:#eee; font-family:sans-serif; text-align:center; }}
+    h1   {{ margin-top:20px; }}
+    img  {{ border:2px solid #555; margin-top:20px; max-width:100%; }}
+    .note {{ margin-top:10px; font-size:0.9em; color:#ccc; }}
+  </style>
+</head>
+<body>
+  <h1>Driveway Zone Calibration</h1>
+  <p class="note">
+    Yellow polygon = <strong>TRACKING_ZONE</strong> from <code>.env</code>
+    (original {ORIG_W}x{ORIG_H}, scaled to stream)
+  </p>
+  <img src="/video" alt="Live stream with tracking zone">
+  <p class="note">Edit <code>TRACKING_ZONE</code> in <code>.env</code> and refresh to update.</p>
+</body>
+</html>"""
 
 
 @app.route("/")
 def index() -> str:
-    """Serve the calibration page."""
-    return HTML_TEMPLATE
+    """Serve the calibration web page."""
+    return _HTML_TEMPLATE
 
 
 @app.route("/video")
 def video() -> Response:
-    """Stream video frames."""
+    """Stream live MJPEG video with zone overlay."""
     return Response(
         gen_frames(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-# ============================================================================
-# Application Entry Point
-# ============================================================================
-
-
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
 def main() -> int:
-    """Main application entry point.
+    """Start RTSP capture and Flask web server.
 
     Returns:
-        int: Exit code (0 for success, 1 for error)
+        int: Exit code (0 = success, 1 = error).
     """
     global cap
-
     try:
         initialize_video_capture()
-        log_zone_config()
-        print(f"Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
+        logger.info(
+            "Zone (original %dx%d): %s", ORIG_W, ORIG_H, TRACKING_ZONE_ORIG.tolist()
+        )
+        logger.info("Starting server → http://%s:%d", FLASK_HOST, FLASK_PORT)
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)
     except RuntimeError as e:
-        print(f"❌ Error: {e}")
+        logger.error("Startup error: %s", e)
         return 1
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        if cap is not None:
-            cap.release()
-            cap = None
-        return 0
+        logger.info("Shutting down...")
     finally:
         if cap is not None:
             cap.release()
+            cap = None
+    return 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())
