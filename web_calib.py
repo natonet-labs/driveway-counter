@@ -55,7 +55,7 @@ load_dotenv()
 
 USERNAME: str = os.getenv("USERNAME", "")
 PASSWORD: str = os.getenv("PASSWORD", "")
-IP_ADDRESS: str = os.getenv("IP_ADDRESS", "")
+IP_ADDRESS: str = os.getenv("IPADDRESS", "")
 CHANNEL: str = os.getenv("CHANNEL", "1")
 SUBTYPE: str = os.getenv("SUBTYPE", "0")
 
@@ -70,10 +70,15 @@ RTSP_URL: str = (
     f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
 )
 
+RTSP_MASKED_URL: str = (
+    f"rtsp://{USERNAME}:***@{IP_ADDRESS}:554"
+    f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
+)
+
 # ---------------------------------------------------------------------------
 # Zone Configuration
 # ---------------------------------------------------------------------------
-_DEFAULT_ZONE = "[[100,50],[600,50],[600,430],[100,430]]"
+_DEFAULT_ZONE = "[[380,3],[480,3],[480,460],[380,460]]"
 _zone_raw: str = os.getenv("TRACKING_ZONE", _DEFAULT_ZONE)
 
 try:
@@ -127,7 +132,7 @@ def initialize_video_capture() -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
 
     if not cap.isOpened():
-        raise RuntimeError(f"RTSP connection failed: {RTSP_URL}")
+        raise RuntimeError(f"RTSP connection failed: {RTSP_MASKED_URL}")
 
     logger.info("RTSP connected (buffer=1, timeout=1s)")
     return cap
