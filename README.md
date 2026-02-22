@@ -14,12 +14,12 @@ Turn your Raspberry Pi 5 into a high-performance AI security camera with this si
 - Hailo AI HAT acceleration (90+ inferences/sec) eliminates GPU dependency
 - Unique ID tracking prevents double-counting across frame boundaries
 - Configurable polygon zones via live web interface-no manual coordinate math
-- Midnight JSON reports:  {"date": "2026-02-21", "entries": 333, "exits": 317}  — tracks all 80 COCO classes
+- Midnight JSON reports: `{"date": "2026-02-21", "entries": 333, "exits": 317}` with support for any of 80 COCO object classes
 - Perfect for home labs wanting production-grade computer vision without cloud dependency or complex multi-container setups. Deployable as systemd service for 24/7 operation.
 
 ## Features
 
-- Real-time detection: people, cars, cats, dogs
+- Real-time object detection: any of 80 COCO classes (people, vehicles, animals, etc.)
 - H.264 low-res stream decoding (RTSP-compatible cameras)
 - 7% CPU, 50°C, 190MB RAM, 15 FPS performance
 - Single Python script deployment
@@ -29,7 +29,7 @@ Turn your Raspberry Pi 5 into a high-performance AI security camera with this si
 
 https://github.com/user-attachments/assets/208b9c0f-3f4d-4b04-af89-2d2af14d28bb
 
-Terminal output showing live detection, tracking, and zone counting. Watch real-time updates: vehicles/people entering and exiting zones, unique tracking IDs, FPS performance, and cumulative counts.
+Terminal output showing live detection, tracking, and zone counting. Watch real-time updates: any COCO class objects entering and exiting zones, unique tracking IDs, FPS performance, and cumulative counts.
 
 ## Hardware Requirements
 
