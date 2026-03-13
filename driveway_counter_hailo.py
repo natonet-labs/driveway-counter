@@ -34,6 +34,7 @@ from urllib.parse import quote
 import cv2
 import gi
 import numpy as np
+import requests
 from dotenv import load_dotenv
 
 gi.require_version("Gst", "1.0")
@@ -232,6 +233,23 @@ def save_report() -> None:
         with open(path, "w") as f:
             json.dump(daily_stats, f, indent=2)
         logger.info("Report saved: %s", path)
+
+        # NEW: Sync to Cloudflare Workers KV
+        worker_url = os.getenv("WORKER_URL")
+        payload = {"key": f"driveway:{daily_stats['date']}", "value": daily_stats}
+        headers = {
+            "Authorization": f"Bearer {os.getenv('CLOUDFLARE_TOKEN')}",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(
+                worker_url, json=payload, headers=headers, timeout=10
+            )
+            response.raise_for_status()
+            logger.info("Metrics synced to Cloudflare: %s", daily_stats["date"])
+        except requests.RequestException as e:
+            logger.error("Cloudflare sync failed: %s", e)
+
     except OSError as e:
         logger.error("Failed to save report to %s: %s", path, e)
 
