@@ -236,9 +236,15 @@ def save_report() -> None:
 
         # NEW: Sync to Cloudflare Workers KV
         worker_url = os.getenv("WORKER_URL")
+        cloudflare_token = os.getenv("CLOUDFLARE_TOKEN")
+        if not worker_url or not cloudflare_token:
+            logger.warning(
+                "WORKER_URL or CLOUDFLARE_TOKEN not set, skipping Cloudflare sync"
+            )
+            return
         payload = {"key": f"driveway:{daily_stats['date']}", "value": daily_stats}
         headers = {
-            "Authorization": f"Bearer {os.getenv('CLOUDFLARE_TOKEN')}",
+            "Authorization": f"Bearer {cloudflare_token}",
             "Content-Type": "application/json",
         }
         try:
