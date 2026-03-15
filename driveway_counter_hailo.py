@@ -102,11 +102,11 @@ APPSINK_DROP_MODE: bool = True
 HAILO_BATCH_SIZE: int = 1
 
 # Hailo tracker configuration parameters
-KALMAN_DIST_THR: float = 1.0
+KALMAN_DIST_THR: float = 1.5
 IOU_THR: float = 0.65
 INIT_IOU_THR: float = 0.7
-KEEP_TRACKED_FRAMES: int = 10
-KEEP_LOST_FRAMES: int = 2
+KEEP_TRACKED_FRAMES: int = 15
+KEEP_LOST_FRAMES: int = 5
 
 # Velocity detection and tracking
 VELOCITY_THRESHOLD: int = 2  # Horizontal pixel displacement threshold
@@ -538,14 +538,18 @@ def build_pipeline_string(
     """
     # Select appropriate decoder based on stream subtype
     if subtype == 1:
-        # H.264 substream decoding
+        # H.264 substream decoding (software — low resolution, cheap)
         decoder = (
             f"rtph264depay ! h264parse ! avdec_h264 max-threads={VIDEO_MAX_THREADS}"
         )
     else:
-        # H.265 main stream decoding
+        # H.265 main stream — hardware decode via RPi5 HEVC engine
+        # h265parse must output byte-stream for v4l2slh265dec
+        # videoconvert handles NV12 → RGB for Hailo downstream
         decoder = (
-            f"rtph265depay ! h265parse ! avdec_h265 max-threads={VIDEO_MAX_THREADS}"
+            "rtph265depay ! "
+            "h265parse ! video/x-h265,stream-format=byte-stream,alignment=au ! "
+            "v4l2slh265dec ! video/x-raw,format=NV12"
         )
 
     # Construct complete GStreamer pipeline string
