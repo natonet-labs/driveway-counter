@@ -102,7 +102,7 @@ APPSINK_DROP_MODE: bool = True
 HAILO_BATCH_SIZE: int = 1
 
 # Hailo tracker configuration parameters
-KALMAN_DIST_THR: float = 1.5
+KALMAN_DIST_THR: float = 0.9
 IOU_THR: float = 0.65
 INIT_IOU_THR: float = 0.7
 KEEP_TRACKED_FRAMES: int = 15
