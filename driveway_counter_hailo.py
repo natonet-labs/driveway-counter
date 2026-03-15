@@ -10,6 +10,7 @@ Features:
     - Bidirectional zone crossing detection with velocity analysis
     - Frame-by-frame tracking with stale track cleanup
     - Daily statistics logging and JSON report generation
+    - Hourly Cloudflare sync via background thread (non-blocking)
     - Configurable confidence thresholds and zone boundaries
 
 Dependencies:
@@ -25,6 +26,8 @@ import ast
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -80,7 +83,7 @@ IMG_W: int = int(os.getenv("IMG_W", "704"))  # Processing frame width
 IMG_H: int = int(os.getenv("IMG_H", "480"))  # Processing frame height
 
 # Detection Settings
-CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.45"))
+CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.30"))
 
 # ============================================================================
 # Model and Pipeline Configuration
@@ -115,6 +118,9 @@ TRACK_TIMEOUT_SEC: int = 60  # Remove tracks not seen for this duration
 
 # Statistics reporting
 STATS_LOG_INTERVAL_SEC: float = 10.0
+
+# Cloudflare upload interval (1 hour — background thread, never blocks inference)
+UPLOAD_INTERVAL_SEC: float = 3600.0
 
 # Debug mode
 IS_DEBUG: bool = os.getenv("ISDEBUG", "False").lower() == "true"
@@ -209,16 +215,74 @@ daily_stats: dict[str, Any] = {
 frame_count: int = 0
 last_log: float = time.monotonic()
 
+# Cloudflare upload tracking (monotonic — never affected by clock changes)
+last_upload: float = time.monotonic()
+
+# ============================================================================
+# Cloudflare Upload — Background Thread
+# ============================================================================
+# All network I/O runs in a dedicated daemon thread. The inference thread
+# never blocks on HTTP — it only does an in-memory queue.put() which returns
+# in microseconds. If Cloudflare is slow or unreachable, only this thread
+# is affected; the GStreamer pipeline continues uninterrupted.
+
+_upload_queue: queue.Queue = queue.Queue()
+
+
+def _cloudflare_upload_worker() -> None:
+    """Background thread that drains the upload queue and POSTs to Cloudflare.
+
+    Runs as a daemon thread for the lifetime of the application. Receives
+    snapshot dicts of daily_stats via _upload_queue. A None sentinel value
+    signals the thread to exit cleanly on shutdown.
+
+    Returns:
+        None
+    """
+    while True:
+        stats = _upload_queue.get()
+        if stats is None:
+            # Shutdown sentinel received
+            _upload_queue.task_done()
+            break
+
+        worker_url = os.getenv("WORKER_URL")
+        cloudflare_token = os.getenv("CLOUDFLARE_TOKEN")
+
+        if not worker_url or not cloudflare_token:
+            logger.warning("WORKER_URL or CLOUDFLARE_TOKEN not set, skipping upload")
+            _upload_queue.task_done()
+            continue
+
+        try:
+            payload = {"key": f"driveway:{stats['date']}", "value": stats}
+            headers = {
+                "Authorization": f"Bearer {cloudflare_token}",
+                "Content-Type": "application/json",
+            }
+            response = requests.post(
+                worker_url, json=payload, headers=headers, timeout=10
+            )
+            response.raise_for_status()
+            logger.info("Metrics synced to Cloudflare: %s", stats["date"])
+        except requests.RequestException as e:
+            logger.error("Cloudflare sync failed: %s", e)
+        finally:
+            _upload_queue.task_done()
+
+
 # ============================================================================
 # Utility Functions
 # ============================================================================
 
 
 def save_report() -> None:
-    """Save daily statistics to JSON report file.
+    """Save daily statistics to JSON report file and queue Cloudflare upload.
 
     Writes the current daily_stats dictionary to a JSON file with a filename
     based on the current date. Reports are saved to REPORT_DIR directory.
+    Cloudflare upload is queued to the background thread — this function
+    never blocks on network I/O.
 
     File naming: driveway_YYYY-MM-DD.json
 
@@ -234,33 +298,13 @@ def save_report() -> None:
             json.dump(daily_stats, f, indent=2)
         logger.info("Report saved: %s", path)
 
-        # NEW: Sync to Cloudflare Workers KV
-        worker_url = os.getenv("WORKER_URL")
-        cloudflare_token = os.getenv("CLOUDFLARE_TOKEN")
-        if not worker_url or not cloudflare_token:
-            logger.warning(
-                "WORKER_URL or CLOUDFLARE_TOKEN not set, skipping Cloudflare sync"
-            )
-            return
-        payload = {"key": f"driveway:{daily_stats['date']}", "value": daily_stats}
-        headers = {
-            "Authorization": f"Bearer {cloudflare_token}",
-            "Content-Type": "application/json",
-        }
-        try:
-            response = requests.post(
-                worker_url, json=payload, headers=headers, timeout=10
-            )
-            response.raise_for_status()
-            logger.info("Metrics synced to Cloudflare: %s", daily_stats["date"])
-        except requests.RequestException as e:
-            logger.error("Cloudflare sync failed: %s", e)
+        # Queue upload to background thread — returns instantly, never blocks
+        _upload_queue.put(dict(daily_stats))
 
     except OSError as e:
         logger.error("Failed to save report to %s: %s", path, e)
 
 
-# ============================================================================
 # ============================================================================
 # GStreamer Callback Functions
 # ============================================================================
@@ -284,13 +328,17 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
         - Runs at STATS_LOG_INTERVAL_SEC interval
         - Prevents memory accumulation over long runs
 
+    Hourly Cloudflare Sync:
+        - Queued to background thread every UPLOAD_INTERVAL_SEC
+        - Never blocks the inference loop
+
     Args:
         sink: GStreamer appsink element emitting sample signals
 
     Returns:
         Gst.FlowReturn: OK on successful processing, OK on error to continue
     """
-    global daily_stats, frame_count, last_log
+    global daily_stats, frame_count, last_log, last_upload
 
     sample = sink.emit("pull-sample")
     if sample is None:
@@ -451,7 +499,7 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
         # Continue processing even on error
 
     # Periodic statistics reporting and stale track cleanup
-    now: float = datetime.now().timestamp()
+    now: float = time.monotonic()
     if now - last_log >= STATS_LOG_INTERVAL_SEC:
         # Calculate frame rate
         time_delta = now - last_log
@@ -480,22 +528,28 @@ def process_frame_detections(sink: Any) -> Gst.FlowReturn:
         last_log = now
         frame_count = 0
 
+    # Hourly Cloudflare upload — queue only, returns instantly
+    if now - last_upload >= UPLOAD_INTERVAL_SEC:
+        _upload_queue.put(dict(daily_stats))
+        last_upload = now
+        logger.info("📤 Hourly metrics queued for Cloudflare upload")
+
     # Check for date rollover (midnight)
     today: str = datetime.now().strftime("%Y-%m-%d")
     if daily_stats["date"] != today:
-        save_report()
+        save_report()  # Saves JSON + queues final upload for the completed day
         daily_stats["date"] = today
         daily_stats["entries"] = 0
         daily_stats["exits"] = 0
         tracked_zones.clear()
         track_last_seen.clear()
         centroid_history.clear()
+        last_upload = now  # Reset hourly timer for new day
         logger.info("🌅 New day started: %s", today)
 
     return Gst.FlowReturn.OK
 
 
-# ============================================================================
 # ============================================================================
 # Pipeline Construction
 # ============================================================================
@@ -636,11 +690,12 @@ def main() -> int:
     """Start driveway counter with Hailo inference and GStreamer pipeline.
 
     This function:
-        1. Validates configuration and model file existence
-        2. Initializes GStreamer and constructs the inference pipeline
-        3. Connects detection callbacks to process Hailo inference results
-        4. Runs the main event loop for continuous frame processing
-        5. Handles graceful shutdown with report saving
+        1. Starts the background Cloudflare upload thread
+        2. Validates configuration and model file existence
+        3. Initializes GStreamer and constructs the inference pipeline
+        4. Connects detection callbacks to process Hailo inference results
+        5. Runs the main event loop for continuous frame processing
+        6. Handles graceful shutdown with report saving and thread cleanup
 
     The application will:
         - Connect to RTSP camera stream using credentials from environment
@@ -648,16 +703,13 @@ def main() -> int:
         - Track objects across frames and detect zone boundary crossings
         - Log entry/exit events with detection confidence
         - Report statistics every STATS_LOG_INTERVAL_SEC seconds
+        - Upload metrics to Cloudflare every UPLOAD_INTERVAL_SEC via background thread
         - Save daily JSON report and roll over statistics at midnight
 
     Returns:
         int: Exit code
             0 = Successful completion or keyboard interrupt
             1 = Configuration error or pipeline initialization failure
-
-    Exit Codes:
-        0: Normal exit (CTRL+C) or successful run
-        1: Model file not found or pipeline creation failed
     """
     logger.info("🚗 Driveway Counter (Hailo 26 TOPS)")
     logger.info("📍 Tracking Zone: %s", TRACKING_ZONE.tolist())
@@ -667,6 +719,17 @@ def main() -> int:
         ORIG_H,
         IMG_W,
         IMG_H,
+    )
+
+    # Start background Cloudflare upload thread
+    upload_thread = threading.Thread(
+        target=_cloudflare_upload_worker,
+        name="cloudflare-uploader",
+        daemon=True,
+    )
+    upload_thread.start()
+    logger.info(
+        "☁️  Cloudflare upload thread started (interval=%ds)", int(UPLOAD_INTERVAL_SEC)
     )
 
     # Initialize GStreamer library
@@ -767,11 +830,17 @@ def main() -> int:
         return 1
     finally:
         # Guaranteed cleanup on any exit path
+
+        # Stop GStreamer pipeline
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
 
-        # Save final statistics report
+        # Save final report (also queues one last Cloudflare upload)
         save_report()
+
+        # Drain upload queue cleanly before exit
+        _upload_queue.put(None)  # Sentinel signals worker thread to exit
+        upload_thread.join(timeout=15)
         logger.info("✅ Application shutdown complete")
 
     return 0
