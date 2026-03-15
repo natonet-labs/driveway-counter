@@ -53,7 +53,7 @@ source .venv/bin/activate
 
 # Install Python dependencies
 pip install --upgrade pip
-pip install python-dotenv numpy==1.26.4 opencv-python==4.11.0.86
+pip install python-dotenv numpy==1.26.4 opencv-python==4.11.0.86 requests
 
 # Verify critical imports
 python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; print('✅ GStreamer OK')"
@@ -86,8 +86,8 @@ ORIG_H=480
 IMG_W=704
 IMG_H=480
 
-# Lower confidence for low-res
-CONF_THRESH=0.45
+# Detection confidence threshold (lower = more detections, more false positives)
+CONF_THRESH=0.30
 
 # SINGLE TRACKING ZONE (top-left, top-right, bottom-right, bottom-left)
 TRACKING_ZONE=[[x,y],[x,y],[x,y],[x,y]]
@@ -96,6 +96,10 @@ TRACKING_ZONE=[[x,y],[x,y],[x,y],[x,y]]
 REPORT_DIR=./reports
 
 ISDEBUG=False
+
+# Cloudflare metrics (optional — leave blank to disable)
+WORKER_URL=
+CLOUDFLARE_TOKEN=
 EOF
 
 # Edit with your actual camera credentials
@@ -192,18 +196,98 @@ python driveway_counter_hailo.py
 **Expected output:**
 ```
 [INFO] 🚗 Driveway Counter (Hailo 26 TOPS)
-[INFO] 📍 Zone: [[380,3], [480,3], [480,460], [380,460]]
+[INFO] 📍 Tracking Zone: [[380, 3], [480, 3], [480, 460], [380, 460]]
+[INFO] ☁️  Cloudflare upload thread started (interval=3600s)
 [INFO] ✅ Model: ./models/yolov8m.hef
-[INFO] 📈 CONF_THRESH=0.45
-[INFO] 🚀 Starting pipeline...
-[INFO] ➡️ ENTER ZONE (vx=16.0 cx=388): car ID:7362 conf=0.81
-[INFO] ➡️ EXIT ZONE (vx=70.0 cx=530):  car ID:7362 conf=0.60
-[INFO] ➡️ EXIT ZONE (vx=67.0 cx=543):  truck ID:7365 conf=0.60
-[INFO] ➡️ ENTER ZONE (vx=12.0 cx=387): car ID:7368 conf=0.81
-[INFO] ➡️ EXIT ZONE (vx=12.0 cx=484):  car ID:7368 conf=0.76
+[INFO] 📊 Confidence threshold: 0.30
+[INFO] 🚀 Starting GStreamer pipeline...
+[INFO] ✅ Pipeline running, processing frames...
+[INFO] ➡️ ENTRY (vx=16.0 cx=388): car ID:7362 conf=0.81
+[INFO] ➡️ EXIT (vx=70.0 cx=530):  car ID:7362 conf=0.60
+[INFO] 📊 Entries=1 Exits=1 | FPS=15 | Tracks=2
+[INFO] 📤 Hourly metrics queued for Cloudflare upload
+[INFO] Metrics synced to Cloudflare: 2026-03-15
 ```
 
 **Stop with:** `Ctrl+C`
+
+---
+
+## ☁️ Cloudflare Metrics Dashboard (Optional)
+
+The counter can sync metrics hourly to Cloudflare Workers KV and serve a live dashboard accessible from anywhere. This is entirely optional — the counter runs fine without it.
+
+### How it works
+
+A background thread in the Python script wakes up every hour, takes a snapshot of the current daily totals, and POSTs it to your Cloudflare Worker. This never blocks the GStreamer inference pipeline. At midnight the final day's totals are also uploaded automatically.
+
+The Worker stores two KV entries per upload:
+- `driveway:YYYY-MM-DD` — the running daily total (overwritten each hour)
+- `hourly:YYYY-MM-DD:HH` — an intraday snapshot for the hour (expires after 48h)
+
+### Step A: Create a Cloudflare Worker
+
+1. Log in to [dash.cloudflare.com](https://dash.cloudflare.com) and go to **Workers & Pages**
+2. Click **Create** → **Create Worker**
+3. Name it `driveway-metrics` and click **Deploy**
+4. Click **Edit code** and replace the default script with the contents of `cloudflare/index.ts` from this repository
+5. Click **Deploy**
+
+### Step B: Create a KV Namespace
+
+1. In the Cloudflare dashboard go to **Workers & Pages** → **KV**
+2. Click **Create a namespace**, name it `DRIVEWAY_METRICS`, and click **Add**
+3. Go back to your `driveway-metrics` worker → **Settings** → **Bindings**
+4. Click **Add** → **KV Namespace**
+5. Set variable name to `DRIVEWAY_METRICS` and select the namespace you just created
+6. Click **Save and deploy**
+
+### Step C: Create an API Token
+
+1. Go to [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
+2. Click **Create Token** → **Create Custom Token**
+3. Give it a name like `driveway-pi`
+4. Under **Permissions** add: `Account` → `Workers KV Storage` → `Edit`
+5. Click **Continue to summary** → **Create Token**
+6. Copy the token — it is only shown once
+
+### Step D: Configure .env on the Pi
+
+Add your Worker URL and token to `.env`:
+
+```bash
+WORKER_URL=https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/api/metrics
+CLOUDFLARE_TOKEN=your_api_token_here
+```
+
+### Step E: Deploy the Dashboard
+
+Host `cloudflare/index.html` anywhere static — Cloudflare Pages is the simplest option:
+
+1. Go to **Workers & Pages** → **Create** → **Pages** → **Upload assets**
+2. Upload `index.html` and deploy
+3. Or simply open the file locally in a browser — it fetches data directly from the Worker API
+
+### Dashboard endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /today` | Today's latest entry/exit totals |
+| `GET /hourly` | Today's intraday snapshots sorted by hour |
+| `GET /dashboard` | Last 30 days of daily totals |
+| `POST /api/metrics` | Upload a metrics snapshot (used by the Pi) |
+
+### Verifying the upload
+
+In the Pi logs you should see:
+```
+[INFO] 📤 Hourly metrics queued for Cloudflare upload
+[INFO] Metrics synced to Cloudflare: 2026-03-15
+```
+
+If you see `Cloudflare sync failed`, check that `WORKER_URL` and `CLOUDFLARE_TOKEN` are set correctly in `.env` and that the Worker is deployed.
+
+**Note:** The intraday hourly chart will be empty until the first upload arrives, which is one hour after the counter starts. The `UPLOAD_INTERVAL_SEC` constant in `driveway_counter_hailo.py` controls the interval (default 3600 seconds).
 
 ---
 
@@ -288,7 +372,7 @@ cat reports/driveway_$(date +%Y-%m-%d).json
 }
 ```
 
-**Report rotation:** New file created automatically at midnight.
+**Report rotation:** New file created automatically at midnight. The final totals are also uploaded to Cloudflare at rollover if configured.
 
 ---
 
@@ -314,7 +398,7 @@ cat reports/driveway_$(date +%Y-%m-%d).json
 **Fixes:**
 ```bash
 # 1. Lower confidence threshold
-nano .env  # Set CONF_THRESH=0.45
+nano .env  # Set CONF_THRESH=0.30
 
 # 2. Verify hailo module
 python -c "import hailo; print(hailo.__file__)"
@@ -322,8 +406,8 @@ python -c "import hailo; print(hailo.__file__)"
 # 3. Check pipeline includes hailofilter
 grep "hailofilter" driveway_counter_hailo.py
 
-# 4. Test with gst-launch-1.0 (Replace special characters with URL-encoded characters)
-gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" latency=300 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=RGB ! hailocropper so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true ! hailonet hef-path=./models/yolov8m.hef batch-size=1 ! fakesink
+# 4. Test with gst-launch-1.0 (replace credentials and URL-encode special characters in password)
+gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" latency=300 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoscale ! video/x-raw,width=704,height=480 ! videoconvert ! video/x-raw,format=RGB ! hailocropper so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true ! hailonet hef-path=./models/yolov8m.hef batch-size=1 ! fakesink
 ```
 
 ---
@@ -333,7 +417,7 @@ gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/real
 
 **Fix:** Verify pipeline includes:
 ```python
-hailotracker name=tracker class-id=-1 kalman-dist-thr=1 iou-thr=0.65 init-iou-thr=0.7 keep-tracked-frames=10 keep-lost-frames=2 !
+hailotracker name=tracker class-id=-1 kalman-dist-thr=0.9 iou-thr=0.65 init-iou-thr=0.7 keep-tracked-frames=15 keep-lost-frames=5 !
 ```
 
 ---
@@ -367,7 +451,7 @@ curl -u username:password http://192.168.1.100
 rm -rf .venv
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
-pip install python-dotenv numpy==1.26.4 opencv-python==4.11.0.86
+pip install python-dotenv numpy==1.26.4 opencv-python==4.11.0.86 requests
 ```
 
 ---
@@ -388,10 +472,40 @@ vcgencmd measure_clock arm
 
 # Monitor system resources
 htop
-
-# Reduce RTSP latency
-# Edit .env: Change latency=300 to latency=100 in pipeline_str
 ```
+
+---
+
+### Issue: "Cloudflare sync failed"
+**Causes:**
+1. `WORKER_URL` or `CLOUDFLARE_TOKEN` missing or incorrect in `.env`
+2. Worker not deployed or binding not configured
+3. Network unreachable from the Pi
+
+**Fixes:**
+```bash
+# 1. Verify .env has both values set
+grep -E "WORKER_URL|CLOUDFLARE_TOKEN" .env
+
+# 2. Test the Worker endpoint manually
+curl -X POST https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/api/metrics \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"driveway:2026-01-01","value":{"date":"2026-01-01","entries":1,"exits":1}}'
+# Expected response: Metrics stored OK
+
+# 3. Test the /today endpoint
+curl https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/today
+```
+
+**Note:** Cloudflare sync failures are logged but never crash the counter. The inference pipeline continues regardless.
+
+---
+
+### Issue: Hourly chart shows no data on dashboard
+**Cause:** The intraday chart is populated by hourly snapshot keys which only exist after the first upload, one hour after the counter starts.
+
+**Fix:** Wait for the first `📤 Hourly metrics queued` log entry. If it never appears, check that `UPLOAD_INTERVAL_SEC` is set to `3600.0` in the script and that the Cloudflare upload thread started (look for `☁️  Cloudflare upload thread started` in logs).
 
 ---
 
@@ -402,13 +516,13 @@ htop
 ├── .venv/                                    # Python virtual environment
 ├── .env                                      # Your configuration (not in git)
 ├── .gitignore                                # Ignore .env, .venv, reports/
-├── driveway_counter_hailo.py      # Main application script
+├── driveway_counter_hailo.py                 # Main application script
 ├── SETUP_GUIDE.md                            # This file
 ├── README.md                                 # Project documentation
 ├── models/
 │   └── yolov8m.hef -> /usr/local/hailo/...  # Symlink to system model
 ├── reports/                                  # Daily JSON reports (not in git)
-│   └── driveway_2026-02-14.json
+│   └── driveway_2026-03-15.json
 └── requirements.txt                          # Python dependencies
 ```
 
@@ -426,7 +540,7 @@ htop
 
 ### ❌ Don't Commit (add to .gitignore):
 - `.venv/`
-- `.env` (contains passwords!)
+- `.env` (contains passwords and API tokens!)
 - `reports/`
 - `models/` (symlinks, system-dependent)
 - `*.pyc`, `__pycache__/`
@@ -442,6 +556,7 @@ htop
 - **Memory:** 190MB RAM
 - **Hailo Utilization:** 30-40% (yolov8m + tracking + postprocessing)
 - **Storage:** ~2-5KB per day (JSON reports)
+- **Cloudflare upload:** background thread, zero inference impact
 
 **What's Running on Hailo 26 TOPS:**
 ✅ YOLOv8m neural network inference (`hailonet`)  
@@ -453,11 +568,13 @@ htop
 - RTSP stream decoding (H.264 → raw frames)
 - Video scaling/format conversion
 - Python logic (zone checking, counting)
+- Cloudflare upload thread (background, non-blocking)
 
 ---
 
 ## 🎯 Zone Configuration Guide
-Update the Zone Configuration section for better formatting. Zones are defined in `.env` using **original camera resolution** coordinates.
+
+Zones are defined in `.env` using **original camera resolution** coordinates.
 
 **Example for low-res stream (704x480):**
 
@@ -486,10 +603,9 @@ x=0                           x=704
 1. Edit `.env`
 2. Modify coordinate arrays (must be 4 corner points, clockwise from top-left)
 3. Save and restart application
-4. Monitor logs for `📥 TRACKING_ZONE` events to verify placement
+4. Monitor logs for zone crossing events to verify placement
 
-**Tip:**
-- Use `web_calib.py` to calibrate coordinates.
+**Tip:** Use `web_calib.py` to calibrate coordinates visually with a live stream overlay.
 
 ---
 
@@ -521,8 +637,8 @@ python driveway_counter_hailo.py
 
 ### Test 1: GStreamer Pipeline Only
 ```bash
-# If password has special characters, url-encode them.
-gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" latency=300 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=RGB ! hailocropper so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so function-name=create_crops use-letterbox=true ! hailonet hef-path=./models/yolov8m.hef batch-size=1 ! fakesink -v
+# If password has special characters, url-encode them
+gst-launch-1.0 rtspsrc location="rtsp://user:password@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" latency=300 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoscale ! video/x-raw,width=704,height=480 ! videoconvert ! video/x-raw,format=RGB ! hailocropper so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so function-name=create_crops use-letterbox=true ! hailonet hef-path=./models/yolov8m.hef batch-size=1 ! fakesink -v
 ```
 
 ### Test 2: Python Hailo Module
@@ -536,11 +652,19 @@ print("✅ All imports successful")
 EOF
 ```
 
-### Test 3: Full Application (Dry Run)
+### Test 3: Cloudflare Worker Endpoint
+```bash
+# Replace with your actual Worker URL and token
+curl https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/today
+curl https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/hourly
+curl https://driveway-metrics.YOUR_SUBDOMAIN.workers.dev/dashboard
+```
+
+### Test 4: Full Application (Dry Run)
 ```bash
 # Edit .env and set CONF_THRESH=0.0 to detect everything
 python driveway_counter_hailo.py
-# You should see many detections
+# You should see many detections and the Cloudflare thread start message
 ```
 
 ---
@@ -551,6 +675,8 @@ python driveway_counter_hailo.py
 - [Hailo RPi5 Examples GitHub](https://github.com/hailo-ai/hailo-rpi5-examples)
 - [GStreamer Hailo Plugin Reference](https://github.com/hailo-ai/tappas)
 - [YOLOv8 Model Zoo](https://github.com/hailo-ai/hailo_model_zoo)
+- [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
+- [Cloudflare KV Documentation](https://developers.cloudflare.com/kv/)
 
 ---
 
@@ -572,7 +698,9 @@ python driveway_counter_hailo.py
 8. ✅ **Live zone calibration** (web_calib.py visualizer)
 9. ✅ **Single-zone logic** (no line-crossing complexity)
 10. ✅ **Low-res optimization** (704×480 substream viable)
-11. ✅ **Jitter-resistant tracking** (parked vehicles ignored)
+11. ✅ **Jitter-resistant tracking** (parked vehicles ignored, tuned Kalman parameters)
 12. ✅ **7% CPU efficiency** (Hailo-8L fully utilized)
+13. ✅ **Cloudflare hourly metrics** (background thread, non-blocking)
+14. ✅ **Live dashboard** (today summary, intraday chart, 30-day history)
 
 **`git clone` and follow this guide to recreate the exact working setup!** 🎯
