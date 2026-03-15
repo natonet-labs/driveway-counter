@@ -255,7 +255,13 @@ def _cloudflare_upload_worker() -> None:
             continue
 
         try:
-            payload = {"key": f"driveway:{stats['date']}", "value": stats}
+            payload = {
+                "key": f"driveway:{stats['date']}",
+                "value": {
+                    **stats,
+                    "hour": datetime.now().hour,  # Pi local hour — fixes UTC offset
+                },
+            }
             headers = {
                 "Authorization": f"Bearer {cloudflare_token}",
                 "Content-Type": "application/json",
