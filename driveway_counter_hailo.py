@@ -204,33 +204,6 @@ centroid_history: dict[int, deque[tuple[int, int]]] = {}
 # Maps track_id -> datetime of last detection
 track_last_seen: dict[int, datetime] = {}
 
-
-def _load_daily_stats() -> dict[str, Any]:
-    """Load today's stats from the JSON report file if it exists.
-
-    This ensures a service restart mid-day resumes from the correct
-    counts rather than resetting to zero and overwriting Cloudflare.
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-    path = f"{os.getenv('REPORT_DIR', './reports')}/driveway_{today}.json"
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-            if data.get("date") == today:
-                logger.info(
-                    "📂 Resumed from existing report: entries=%d exits=%d",
-                    data["entries"],
-                    data["exits"],
-                )
-                return data
-    except (OSError, json.JSONDecodeError):
-        pass  # No existing report — start fresh
-    return {"date": today, "entries": 0, "exits": 0}
-
-
-# Daily statistics accumulator — resumes from disk on restart
-daily_stats: dict[str, Any] = _load_daily_stats()
-
 # Frame processing metrics
 frame_count: int = 0
 last_log: float = time.monotonic()
@@ -295,6 +268,33 @@ def _cloudflare_upload_worker() -> None:
             logger.error("Cloudflare sync failed: %s", e)
         finally:
             _upload_queue.task_done()
+
+
+def _load_daily_stats() -> dict[str, Any]:
+    """Load today's stats from the JSON report file if it exists.
+
+    This ensures a service restart mid-day resumes from the correct
+    counts rather than resetting to zero and overwriting Cloudflare.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = f"{os.getenv('REPORT_DIR', './reports')}/driveway_{today}.json"
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            if data.get("date") == today:
+                logger.info(
+                    "📂 Resumed from existing report: entries=%d exits=%d",
+                    data["entries"],
+                    data["exits"],
+                )
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass  # No existing report — start fresh
+    return {"date": today, "entries": 0, "exits": 0}
+
+
+# Daily statistics accumulator — resumes from disk on restart
+daily_stats: dict[str, Any] = _load_daily_stats()
 
 
 # ============================================================================
