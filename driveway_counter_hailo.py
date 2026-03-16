@@ -204,12 +204,8 @@ centroid_history: dict[int, deque[tuple[int, int]]] = {}
 # Maps track_id -> datetime of last detection
 track_last_seen: dict[int, datetime] = {}
 
-# Daily statistics accumulator
-daily_stats: dict[str, Any] = {
-    "date": datetime.now().strftime("%Y-%m-%d"),
-    "entries": 0,
-    "exits": 0,
-}
+# Daily statistics accumulator — resumes from disk on restart
+daily_stats: dict[str, Any] = _load_daily_stats()
 
 # Frame processing metrics
 frame_count: int = 0
@@ -227,6 +223,29 @@ last_upload: float = time.monotonic()
 # is affected; the GStreamer pipeline continues uninterrupted.
 
 _upload_queue: queue.Queue = queue.Queue()
+
+
+def _load_daily_stats() -> dict[str, Any]:
+    """Load today's stats from the JSON report file if it exists.
+
+    This ensures a service restart mid-day resumes from the correct
+    counts rather than resetting to zero and overwriting Cloudflare.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = f"{os.getenv('REPORT_DIR', './reports')}/driveway_{today}.json"
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            if data.get("date") == today:
+                logger.info(
+                    "📂 Resumed from existing report: entries=%d exits=%d",
+                    data["entries"],
+                    data["exits"],
+                )
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass  # No existing report — start fresh
+    return {"date": today, "entries": 0, "exits": 0}
 
 
 def _cloudflare_upload_worker() -> None:
