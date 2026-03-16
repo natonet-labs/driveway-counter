@@ -204,26 +204,6 @@ centroid_history: dict[int, deque[tuple[int, int]]] = {}
 # Maps track_id -> datetime of last detection
 track_last_seen: dict[int, datetime] = {}
 
-# Daily statistics accumulator — resumes from disk on restart
-daily_stats: dict[str, Any] = _load_daily_stats()
-
-# Frame processing metrics
-frame_count: int = 0
-last_log: float = time.monotonic()
-
-# Cloudflare upload tracking (monotonic — never affected by clock changes)
-last_upload: float = time.monotonic()
-
-# ============================================================================
-# Cloudflare Upload — Background Thread
-# ============================================================================
-# All network I/O runs in a dedicated daemon thread. The inference thread
-# never blocks on HTTP — it only does an in-memory queue.put() which returns
-# in microseconds. If Cloudflare is slow or unreachable, only this thread
-# is affected; the GStreamer pipeline continues uninterrupted.
-
-_upload_queue: queue.Queue = queue.Queue()
-
 
 def _load_daily_stats() -> dict[str, Any]:
     """Load today's stats from the JSON report file if it exists.
@@ -246,6 +226,27 @@ def _load_daily_stats() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         pass  # No existing report — start fresh
     return {"date": today, "entries": 0, "exits": 0}
+
+
+# Daily statistics accumulator — resumes from disk on restart
+daily_stats: dict[str, Any] = _load_daily_stats()
+
+# Frame processing metrics
+frame_count: int = 0
+last_log: float = time.monotonic()
+
+# Cloudflare upload tracking (monotonic — never affected by clock changes)
+last_upload: float = time.monotonic()
+
+# ============================================================================
+# Cloudflare Upload — Background Thread
+# ============================================================================
+# All network I/O runs in a dedicated daemon thread. The inference thread
+# never blocks on HTTP — it only does an in-memory queue.put() which returns
+# in microseconds. If Cloudflare is slow or unreachable, only this thread
+# is affected; the GStreamer pipeline continues uninterrupted.
+
+_upload_queue: queue.Queue = queue.Queue()
 
 
 def _cloudflare_upload_worker() -> None:
