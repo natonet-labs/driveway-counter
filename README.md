@@ -66,7 +66,7 @@ cd driveway-counter
 
 # 3. Setup Python environment (Python 3.13 with system Hailo bindings)
 python3 -m venv .venv --system-site-packages
-# Ensure venv can see /usr/lib/python3/dist-packages where hailo.cpython-313-*.so lives
+# Make sure venv can see /usr/lib/python3/dist-packages (where hailo.cpython-313-*.so lives)
 echo "/usr/lib/python3/dist-packages" > .venv/lib/python3.13/site-packages/system_packages.pth
 source .venv/bin/activate
 pip install -r requirements.txt
