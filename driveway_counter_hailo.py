@@ -141,7 +141,7 @@ CENTROID_HISTORY_SIZE: int = 5
 # Remove a track from state after this many seconds without a detection.
 # 300 s lets a parked car sit for 5 minutes before its state is wiped;
 # shorter values (e.g. 60 s) cause re-ID and potential double-counts.
-TRACK_TIMEOUT_SEC: int = 300
+TRACK_TIMEOUT_SEC: int = 60
 
 # ---------------------------------------------------------------------------
 # Reporting / upload

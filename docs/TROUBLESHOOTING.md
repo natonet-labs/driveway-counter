@@ -199,16 +199,38 @@ gst-launch-1.0 \
 
 ---
 
-## Issue 4: `hailocropper` Pipeline Error / `libwhole_buffer.so` Not Found
+## Issue 4: `hailocropper` Segfault on GStreamer 1.26+
 
-The original hailo-rpi5-examples documentation references:
+**Symptom:** App crashes immediately with `SIGSEGV` / `status=11/SEGV` after the Cloudflare thread starts, before the pipeline produces any output.
+
+**Root cause:** GStreamer 1.26.2 (shipped in a system update) broke `hailocropper` when run without `so-path`. The element segfaults during `pipeline.set_state(PLAYING)`. Earlier GStreamer versions handled the no-`so-path` passthrough mode correctly; 1.26+ does not.
+
+**The fix:** `libwhole_buffer.so` is present on your system via `hailo-tappas-core` — no full TAPPAS source build required. The current `driveway_counter_hailo.py` passes it explicitly:
+
 ```
 so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so
+function-name=create_crops
 ```
 
-**Do not use this path.** `libwhole_buffer.so` is only present after a full TAPPAS source build, which is not required for this application. Running `hailocropper` without `so-path` uses the built-in whole-buffer passthrough mode, which works correctly with `hailo-all` / `hailo-tappas-core`.
+**Verify the library exists:**
+```bash
+ls -l /usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so
+```
 
-The current `driveway_counter_hailo.py` does not set `so-path` on `hailocropper`. If you see this path in any version of the script, remove it.
+If it is missing, reinstall `hailo-tappas-core`:
+```bash
+sudo apt install hailo-tappas-core -y
+```
+
+**Also required on GStreamer 1.26+:** `videoscale` must declare `format=RGB` explicitly in its caps filter or `hailonet` will refuse to link:
+```
+videoscale ! video/x-raw,format=RGB,width=704,height=480
+```
+
+Without `format=RGB` on the caps filter you will see:
+```
+could not link videoscale0 to hailonet0, hailonet0 can't handle caps video/x-raw, width=(int)704, height=(int)480
+```
 
 ---
 
