@@ -93,6 +93,13 @@ HEF_MODEL_PATH: str = "./models/yolov8m.hef"
 # YOLO postprocess shared library (installed by hailo-all / hailo-rpi5-examples)
 YOLO_POST_SO: str = "/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so"
 
+# Required by hailocropper on GStreamer 1.26+.
+# Omitting so-path causes a segfault on GStreamer 1.26.2.
+WHOLE_BUFFER_SO: str = (
+    "/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes"
+    "/cropping_algorithms/libwhole_buffer.so"
+)
+
 # ---------------------------------------------------------------------------
 # GStreamer / pipeline tuning
 # ---------------------------------------------------------------------------
@@ -510,10 +517,9 @@ def _build_pipeline(rtsp_url: str) -> str:
 
     Design notes
     ------------
-    * hailocropper runs WITHOUT so-path — the default passthrough/whole-buffer
-      mode works with hailo-all / hailo-tappas-core and does NOT require a
-      full TAPPAS source build (libwhole_buffer.so).  See TROUBLESHOOTING.md
-      section 5.3.
+    * hailocropper requires so-path=libwhole_buffer.so on GStreamer 1.26+.
+      Omitting so-path causes a segfault. The library ships with hailo-tappas-core
+      at /usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/.
     * RTSP latency is 300 ms (local network).  The original 2000 ms added
       unnecessary startup delay.
     * H.264 substream (SUBTYPE=1) uses software avdec_h264 capped at
@@ -542,10 +548,12 @@ def _build_pipeline(rtsp_url: str) -> str:
             f" drop-on-latency=true timeout={RTSP_TIMEOUT_US} name=src !",
             f"application/x-rtp,media=video ! {decode} !",
             f"videoconvert ! video/x-raw,format=RGB !",
-            f"videoscale ! video/x-raw,width={IMG_W},height={IMG_H} !",
-            # Hailo preprocessing — no so-path needed for whole-buffer crop
-            "hailocropper name=cropper"
-            " use-letterbox=true resize-method=inter-area internal-offset=true",
+            f"videoscale ! video/x-raw,format=RGB,width={IMG_W},height={IMG_H} !",
+            # hailocropper requires so-path on GStreamer 1.26+ — omitting it segfaults
+            f"hailocropper name=cropper"
+            f" so-path={WHOLE_BUFFER_SO}"
+            f" function-name=create_crops"
+            f" use-letterbox=true resize-method=inter-area internal-offset=true",
             # Aggregator collects both branches
             "hailoaggregator name=agg",
             # Branch 0: passthrough reference frames
@@ -617,6 +625,7 @@ def main() -> int:
     for label, path in [
         ("HEF model", HEF_MODEL_PATH),
         ("YOLO postprocess SO", YOLO_POST_SO),
+        ("Whole-buffer cropper SO", WHOLE_BUFFER_SO),
     ]:
         if not os.path.exists(path):
             logger.error("❌ %s not found: %s", label, path)
