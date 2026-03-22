@@ -92,7 +92,6 @@ HEF_MODEL_PATH: str = "./models/yolov8m.hef"
 
 # YOLO postprocess shared library (installed by hailo-all / hailo-rpi5-examples)
 YOLO_POST_SO: str = "/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so"
-COCO_LABELS_JSON: str = "/usr/local/hailo/resources/barcode_labels/coco_80.json"
 
 # ---------------------------------------------------------------------------
 # GStreamer / pipeline tuning
@@ -554,9 +553,7 @@ def _build_pipeline(rtsp_url: str) -> str:
             # Branch 1: inference
             "cropper. ! queue leaky=downstream max-size-buffers=2 ! videoconvert !",
             f"hailonet hef-path={HEF_MODEL_PATH} batch-size={HAILO_BATCH_SIZE} !",
-            f"hailofilter so-path={YOLO_POST_SO}"
-            f" config-path={COCO_LABELS_JSON}"
-            f" function-name=filter qos=false !",
+            f"hailofilter so-path={YOLO_POST_SO}" f" function-name=filter qos=false !",
             "queue leaky=downstream max-size-buffers=2 ! agg.sink_1",
             # Tracker + output
             "agg. ! queue leaky=downstream max-size-buffers=2 !",
@@ -620,7 +617,6 @@ def main() -> int:
     for label, path in [
         ("HEF model", HEF_MODEL_PATH),
         ("YOLO postprocess SO", YOLO_POST_SO),
-        ("COCO labels JSON", COCO_LABELS_JSON),
     ]:
         if not os.path.exists(path):
             logger.error("❌ %s not found: %s", label, path)
