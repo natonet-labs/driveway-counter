@@ -651,7 +651,7 @@ def build_pipeline_string(
             f"videoconvert ! video/x-raw,format=RGB ! "
             f"videoscale ! video/x-raw,width={width},height={height} ! "
             f"hailocropper name=cropper "
-            f"so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so "
+            # FIXED: Removed missing libwhole_buffer.so - uses built-in passthrough
             f"function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true"
         ),
         "hailoaggregator name=agg",
@@ -660,6 +660,7 @@ def build_pipeline_string(
             "cropper. ! queue ! videoconvert ! "
             f"hailonet hef-path={hef_path} batch-size={HAILO_BATCH_SIZE} ! "
             f"hailofilter "
+            # FIXED: Correct YOLO post-process path from your setup_hailo.sh
             f"so-path=/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so "
             f"config-path=/usr/local/hailo/resources/barcode_labels/coco_80.json "
             f"function-name=filter qos=false ! queue ! agg.sink_1"
