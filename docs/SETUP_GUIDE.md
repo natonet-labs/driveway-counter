@@ -173,6 +173,22 @@ ls -l /usr/local/hailo/resources/barcode_labels/coco_80.json
 
 ---
 
+### Prevent driver conflicts on future kernel updates
+
+The system may load `hailo1x_pci` (Hailo-10 driver) alongside the correct
+`hailo_pci` (Hailo-8 driver) after a kernel update. Blacklist it now to
+prevent `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` errors in the future:
+```bash
+echo "blacklist hailo1x_pci" | sudo tee /etc/modprobe.d/hailo-blacklist.conf
+sudo update-initramfs -u
+```
+
+Verify only the correct driver is present:
+```bash
+lsmod | grep hailo
+# Expected: hailo_pci   (hailo1x_pci should NOT appear)
+```
+
 ### Step 7: Test RTSP Camera Connection
 ```bash
 # Test with ffmpeg (optional but recommended)

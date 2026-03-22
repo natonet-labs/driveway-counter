@@ -291,6 +291,25 @@ Do **not** reintroduce the `so-path=...libwhole_buffer.so` line unless you also 
 
 ## 6. Common Runtime Errors & Fixes
 
+### Most common cause: systemd service already running
+
+Before running manually, always stop the service first:
+
+    sudo systemctl stop driveway-counter.service
+
+The service is configured with `Restart=always`, so after any crash it
+respawns within 10 seconds and reclaims /dev/hailo0. Any manual launch
+attempt while the service is active will fail with HAILO_OUT_OF_PHYSICAL_DEVICES(74).
+
+Use this workflow for manual debugging:
+
+    sudo systemctl stop driveway-counter.service
+    python3 driveway_counter_hailo.py
+
+When done, restart the service:
+
+    sudo systemctl start driveway-counter.service
+
 ### 6.1 `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` during pipeline start
 
 Symptoms:
