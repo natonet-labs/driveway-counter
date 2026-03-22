@@ -650,7 +650,9 @@ def build_pipeline_string(
             f"application/x-rtp,media=video ! {decoder} ! "
             f"videoconvert ! video/x-raw,format=RGB ! "
             f"videoscale ! video/x-raw,width={width},height={height} ! "
-            f"hailocropper name=cropper"
+            f"hailocropper name=cropper "
+            f"so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so "
+            f"function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true"
         ),
         "hailoaggregator name=agg",
         "cropper. ! queue ! agg.sink_0",
