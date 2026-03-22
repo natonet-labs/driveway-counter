@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """Hailo Driveway Counter - Single zone traffic counting system.
 
-This application tracks vehicles entering/exiting a single driveway zone using
-Hailo AI accelerator for inference and GStreamer for video processing. Detections
-are counted directionally (entries vs exits) and daily statistics are reported.
+Tracks objects entering/exiting a single driveway zone using a Hailo-8
+AI accelerator for inference and GStreamer for video processing.
+Detections are counted directionally (entries vs exits) and daily
+statistics are persisted to JSON reports with optional hourly Cloudflare sync.
 
-Features:
-    - Real-time object detection using Hailo YOLOv8m model
-    - Bidirectional zone crossing detection with velocity analysis
-    - Frame-by-frame tracking with stale track cleanup
-    - Daily statistics logging and JSON report generation
-    - Hourly Cloudflare sync via background thread (non-blocking)
-    - Configurable confidence thresholds and zone boundaries
+Hardware: Raspberry Pi 5 + Hailo-8 AI HAT (26 TOPS)
 
 Dependencies:
-    - cv2 (OpenCV): Video frame processing
-    - gi (PyGObject): GStreamer bindings for pipeline construction
-    - numpy: Numerical operations and zone coordinate handling
-    - python-dotenv: Environment variable configuration loading
+    - gi (PyGObject): GStreamer pipeline construction
+    - hailo: Hailo Python bindings (system package, not pip)
+    - cv2 (OpenCV): Zone polygon mask construction
+    - numpy: Zone coordinate scaling
+    - python-dotenv: .env configuration loading
+    - requests: Cloudflare metrics upload (background thread only)
 """
 
 from __future__ import annotations
@@ -41,22 +38,23 @@ import requests
 from dotenv import load_dotenv
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib  # noqa: E402
+from gi.repository import GLib, Gst  # noqa: E402
 
 try:
     import hailo
 except ImportError as e:
     raise SystemExit(
-        f"Hailo Python module not found. "
-        f"Ensure venv uses --system-site-packages. Error: {e}"
+        "Hailo Python module not found. "
+        "Ensure venv uses --system-site-packages and that "
+        "/usr/lib/python3/dist-packages is in system_packages.pth. "
+        f"Error: {e}"
     )
 
-# Load environment variables
 load_dotenv()
 
-# ============================================================================
-# Logging Configuration
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,185 +63,176 @@ logging.basicConfig(
 )
 logger: logging.Logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Camera Configuration (from .env)
-# ============================================================================
+IS_DEBUG: bool = os.getenv("ISDEBUG", "False").lower() == "true"
+if IS_DEBUG:
+    logger.setLevel(logging.DEBUG)
 
-# RTSP Camera credentials and connection
+# ---------------------------------------------------------------------------
+# Camera / stream configuration
+# ---------------------------------------------------------------------------
+
 USERNAME: str = os.getenv("USERNAME", "")
 PASSWORD: str = os.getenv("PASSWORD", "")
 IPADDRESS: str = os.getenv("IPADDRESS", "")
 CHANNEL: int = int(os.getenv("CHANNEL", "1"))
-SUBTYPE: int = int(os.getenv("SUBTYPE", "0"))  # 0=H.265, 1=H.264
+SUBTYPE: int = int(os.getenv("SUBTYPE", "1"))  # 1 = H.264 substream (low CPU)
 
-# Camera resolution settings
-ORIG_W: int = int(os.getenv("ORIG_W", "704"))  # Original camera width
-ORIG_H: int = int(os.getenv("ORIG_H", "480"))  # Original camera height
-IMG_W: int = int(os.getenv("IMG_W", "704"))  # Processing frame width
-IMG_H: int = int(os.getenv("IMG_H", "480"))  # Processing frame height
+ORIG_W: int = int(os.getenv("ORIG_W", "704"))
+ORIG_H: int = int(os.getenv("ORIG_H", "480"))
+IMG_W: int = int(os.getenv("IMG_W", "704"))
+IMG_H: int = int(os.getenv("IMG_H", "480"))
 
-# Detection Settings
 CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.30"))
 
-# ============================================================================
-# Model and Pipeline Configuration
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
-# Hailo model file path
 HEF_MODEL_PATH: str = "./models/yolov8m.hef"
 
-# GStreamer RTSP source parameters
-RTSP_LATENCY_MS: int = 2000
-RTSP_TIMEOUT_US: int = 5000000
+# YOLO postprocess shared library (installed by hailo-all / hailo-rpi5-examples)
+YOLO_POST_SO: str = "/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so"
+COCO_LABELS_JSON: str = "/usr/local/hailo/resources/barcode_labels/coco_80.json"
 
-# Video processing thread and buffer settings
-VIDEO_MAX_THREADS: int = 2
-APPSINK_MAX_BUFFERS: int = 2
-APPSINK_DROP_MODE: bool = True
+# ---------------------------------------------------------------------------
+# GStreamer / pipeline tuning
+# ---------------------------------------------------------------------------
 
-# Hailo inference parameters
+# 300 ms is sufficient for a local-network camera; 2000 ms adds unnecessary
+# latency and slows pipeline startup.
+RTSP_LATENCY_MS: int = 300
+
+# Only relevant for UDP transport; we force TCP so this is a safety fallback.
+RTSP_TIMEOUT_US: int = 5_000_000
+
+# H.264 software decoder thread cap (hardware v4l2slh265dec ignores this)
+H264_MAX_THREADS: int = 2
+
 HAILO_BATCH_SIZE: int = 1
 
-# Hailo tracker configuration parameters
+# Hailo tracker (Kalman filter) — tuned for driveway vehicle speeds
 KALMAN_DIST_THR: float = 0.9
 IOU_THR: float = 0.65
 INIT_IOU_THR: float = 0.7
 KEEP_TRACKED_FRAMES: int = 15
 KEEP_LOST_FRAMES: int = 5
 
-# Velocity detection and tracking
-VELOCITY_THRESHOLD: int = 2  # Horizontal pixel displacement threshold
-CENTROID_HISTORY_SIZE: int = 5  # Number of frames to track for velocity
-TRACK_TIMEOUT_SEC: int = 60  # Remove tracks not seen for this duration
+# appsink — drop oldest frames under load rather than stalling the pipeline
+APPSINK_MAX_BUFFERS: int = 2
+APPSINK_DROP: bool = True
 
-# Statistics reporting
+# ---------------------------------------------------------------------------
+# Counting / tracking tuning
+# ---------------------------------------------------------------------------
+
+# Minimum horizontal pixel displacement per frame to register a crossing.
+# Prevents stationary jitter from generating false counts.
+VELOCITY_THRESHOLD: int = 2
+
+# Centroid x-history depth for velocity smoothing
+CENTROID_HISTORY_SIZE: int = 5
+
+# Remove a track from state after this many seconds without a detection.
+# 300 s lets a parked car sit for 5 minutes before its state is wiped;
+# shorter values (e.g. 60 s) cause re-ID and potential double-counts.
+TRACK_TIMEOUT_SEC: int = 300
+
+# ---------------------------------------------------------------------------
+# Reporting / upload
+# ---------------------------------------------------------------------------
+
+REPORT_DIR: str = os.getenv("REPORT_DIR", "./reports")
+os.makedirs(REPORT_DIR, exist_ok=True)
+
 STATS_LOG_INTERVAL_SEC: float = 10.0
-
-# Cloudflare upload interval (1 hour — background thread, never blocks inference)
 UPLOAD_INTERVAL_SEC: float = 3600.0
 
-# Debug mode
-IS_DEBUG: bool = os.getenv("ISDEBUG", "False").lower() == "true"
-if IS_DEBUG:
-    logger.setLevel(logging.DEBUG)
-
-# ============================================================================
-# Zone Configuration
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Zone setup
+# ---------------------------------------------------------------------------
 
 
 def _parse_zone(env_var: str, default: str) -> np.ndarray:
-    """Safely parse zone coordinates from environment variable.
+    """Parse a zone polygon from an environment variable.
 
-    Uses ast.literal_eval for safe parsing of coordinate strings, falling back
-    to a default zone if parsing fails. This prevents arbitrary code execution
-    from untrusted configuration sources.
-
-    Args:
-        env_var: Environment variable name to retrieve zone coordinates from
-        default: Default zone coordinate string if env var is invalid or missing
+    Falls back to *default* if the variable is absent or malformed.
+    Uses ast.literal_eval — no arbitrary code execution risk.
 
     Returns:
-        np.ndarray: Zone vertices as Nx2 int32 array with shape (n_points, 2)
-
-    Example:
-        >>> zone = _parse_zone("ZONE", "[[100,50],[200,50],[200,400],[100,400]]")
-        >>> zone.shape
-        (4, 2)
+        np.ndarray: shape (N, 2), dtype int32
     """
-    val = os.getenv(env_var, default)
+    raw = os.getenv(env_var, default)
     try:
-        pts = ast.literal_eval(val)
-    except (ValueError, SyntaxError) as e:
-        logger.warning("Invalid %s format: %s, using default", env_var, e)
+        pts = ast.literal_eval(raw)
+    except (ValueError, SyntaxError) as exc:
+        logger.warning("Invalid %s — using default. Error: %s", env_var, exc)
         pts = ast.literal_eval(default)
     return np.array(pts, dtype=np.int32)
 
 
-# Single tracking zone (covers driveway centerline) in ORIGINAL resolution
+# Zone defined in original camera resolution, scaled to processing resolution
 TRACKING_ZONE_ORIG: np.ndarray = _parse_zone(
     "TRACKING_ZONE",
     "[[100,10],[600,10],[600,460],[100,460]]",
 )
 
-# Scale zone from original to processing resolution
-_scale_x: float = IMG_W / ORIG_W
-_scale_y: float = IMG_H / ORIG_H
-TRACKING_ZONE: np.ndarray = (
-    TRACKING_ZONE_ORIG * np.array([_scale_x, _scale_y])
-).astype(np.int32)
+_sx: float = IMG_W / ORIG_W
+_sy: float = IMG_H / ORIG_H
+TRACKING_ZONE: np.ndarray = (TRACKING_ZONE_ORIG * np.array([_sx, _sy])).astype(np.int32)
 
-# Pre-computed zone mask for efficient spatial queries
-tracking_mask: np.ndarray = cv2.fillPoly(
+# 2-D polygon mask — used for accurate point-in-polygon zone checks.
+# This replaces the previous 1-D x-range comparison which ignored the
+# polygon's y-extent and shape entirely.
+ZONE_MASK: np.ndarray = cv2.fillPoly(
     np.zeros((IMG_H, IMG_W), dtype=np.uint8),
     [TRACKING_ZONE],
     255,
 )
 
-# ============================================================================
-# Application Settings
-# ============================================================================
+# Pre-compute the horizontal entry/exit boundary x-coordinates from the
+# polygon's left and right extents (used for direction detection only —
+# containment uses ZONE_MASK).
+_ZONE_X_MIN: int = int(TRACKING_ZONE[:, 0].min())
+_ZONE_X_MAX: int = int(TRACKING_ZONE[:, 0].max())
 
-# Report output directory
-REPORT_DIR: str = os.getenv("REPORT_DIR", "./reports")
-os.makedirs(REPORT_DIR, exist_ok=True)
 
-# ============================================================================
-# Global State
-# ============================================================================
+def point_in_zone(cx: int, cy: int) -> bool:
+    """Return True if pixel (cx, cy) lies inside the tracking zone polygon."""
+    if not (0 <= cx < IMG_W and 0 <= cy < IMG_H):
+        return False
+    return bool(ZONE_MASK[cy, cx])
 
-# Object tracking state
-# Maps track_id -> {"zone": "in"|"out", "entered": bool, "exited": bool}
-tracked_zones: dict[int, dict[str, Any]] = {}
 
-# Centroid history for velocity calculation
-# Maps track_id -> deque of x-coordinates (newest at right)
-centroid_history: dict[int, deque[tuple[int, int]]] = {}
-
-# Track visibility timestamps for stale track cleanup
-# Maps track_id -> datetime of last detection
-track_last_seen: dict[int, datetime] = {}
-
-# Frame processing metrics
-frame_count: int = 0
-last_log: float = time.monotonic()
-
-# Cloudflare upload tracking (monotonic — never affected by clock changes)
-last_upload: float = time.monotonic()
-
-# ============================================================================
-# Cloudflare Upload — Background Thread
-# ============================================================================
-# All network I/O runs in a dedicated daemon thread. The inference thread
-# never blocks on HTTP — it only does an in-memory queue.put() which returns
-# in microseconds. If Cloudflare is slow or unreachable, only this thread
-# is affected; the GStreamer pipeline continues uninterrupted.
+# ---------------------------------------------------------------------------
+# Cloudflare upload — dedicated background thread
+# ---------------------------------------------------------------------------
+# The inference callback does an in-memory queue.put() (microseconds).
+# All HTTP I/O is isolated here — a slow or unreachable Cloudflare endpoint
+# never stalls the GStreamer pipeline.
 
 _upload_queue: queue.Queue = queue.Queue()
 
 
 def _cloudflare_upload_worker() -> None:
-    """Background thread that drains the upload queue and POSTs to Cloudflare.
+    """Drain the upload queue and POST snapshots to Cloudflare Workers KV.
 
-    Runs as a daemon thread for the lifetime of the application. Receives
-    snapshot dicts of daily_stats via _upload_queue. A None sentinel value
-    signals the thread to exit cleanly on shutdown.
-
-    Returns:
-        None
+    Exits cleanly when it receives a None sentinel on the queue.
     """
+    worker_url = os.getenv("WORKER_URL", "")
+    cf_token = os.getenv("CLOUDFLARE_TOKEN", "")
+
+    if not worker_url or not cf_token:
+        logger.warning(
+            "WORKER_URL or CLOUDFLARE_TOKEN not set — Cloudflare sync disabled"
+        )
+
     while True:
         stats = _upload_queue.get()
         if stats is None:
-            # Shutdown sentinel received
             _upload_queue.task_done()
             break
 
-        worker_url = os.getenv("WORKER_URL")
-        cloudflare_token = os.getenv("CLOUDFLARE_TOKEN")
-
-        if not worker_url or not cloudflare_token:
-            logger.warning("WORKER_URL or CLOUDFLARE_TOKEN not set, skipping upload")
+        if not worker_url or not cf_token:
             _upload_queue.task_done()
             continue
 
@@ -252,506 +241,395 @@ def _cloudflare_upload_worker() -> None:
                 "key": f"driveway:{stats['date']}",
                 "value": {
                     **stats,
-                    "hour": datetime.now().hour,  # Pi local hour — fixes UTC offset
+                    "hour": datetime.now().hour,
                 },
             }
-            headers = {
-                "Authorization": f"Bearer {cloudflare_token}",
-                "Content-Type": "application/json",
-            }
             response = requests.post(
-                worker_url, json=payload, headers=headers, timeout=10
+                worker_url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {cf_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
             )
             response.raise_for_status()
             logger.info("Metrics synced to Cloudflare: %s", stats["date"])
-        except requests.RequestException as e:
-            logger.error("Cloudflare sync failed: %s", e)
+        except requests.RequestException as exc:
+            logger.error("Cloudflare sync failed: %s", exc)
         finally:
             _upload_queue.task_done()
 
 
-def _load_daily_stats() -> dict[str, Any]:
-    """Load today's stats from the JSON report file if it exists.
+# ---------------------------------------------------------------------------
+# Daily stats — persisted across restarts
+# ---------------------------------------------------------------------------
 
-    This ensures a service restart mid-day resumes from the correct
-    counts rather than resetting to zero and overwriting Cloudflare.
+
+def _load_daily_stats() -> dict[str, Any]:
+    """Load today's JSON report from disk if it exists.
+
+    Resuming from disk means a mid-day service restart does not reset counts
+    or overwrite Cloudflare with zeroes.
     """
     today = datetime.now().strftime("%Y-%m-%d")
-    path = f"{os.getenv('REPORT_DIR', './reports')}/driveway_{today}.json"
+    path = f"{REPORT_DIR}/driveway_{today}.json"
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
-            if data.get("date") == today:
-                logger.info(
-                    "📂 Resumed from existing report: entries=%d exits=%d",
-                    data["entries"],
-                    data["exits"],
-                )
-                return data
+        with open(path) as fh:
+            data = json.load(fh)
+        if data.get("date") == today:
+            logger.info(
+                "📂 Resumed from existing report: entries=%d exits=%d",
+                data["entries"],
+                data["exits"],
+            )
+            return data
     except (OSError, json.JSONDecodeError):
-        pass  # No existing report — start fresh
+        pass
     return {"date": today, "entries": 0, "exits": 0}
 
 
-# Daily statistics accumulator — resumes from disk on restart
 daily_stats: dict[str, Any] = _load_daily_stats()
 
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+def _save_report() -> None:
+    """Write daily_stats to disk and queue a Cloudflare upload.
 
-
-def save_report() -> None:
-    """Save daily statistics to JSON report file and queue Cloudflare upload.
-
-    Writes the current daily_stats dictionary to a JSON file with a filename
-    based on the current date. Reports are saved to REPORT_DIR directory.
-    Cloudflare upload is queued to the background thread — this function
-    never blocks on network I/O.
-
-    File naming: driveway_YYYY-MM-DD.json
-
-    Returns:
-        None
-
-    Raises:
-        OSError: If file write fails
+    Never blocks — the upload is handed off to the background thread.
     """
     path = f"{REPORT_DIR}/driveway_{daily_stats['date']}.json"
     try:
-        with open(path, "w") as f:
-            json.dump(daily_stats, f, indent=2)
+        with open(path, "w") as fh:
+            json.dump(daily_stats, fh, indent=2)
         logger.info("Report saved: %s", path)
-
-        # Queue upload to background thread — returns instantly, never blocks
         _upload_queue.put(dict(daily_stats))
-
-    except OSError as e:
-        logger.error("Failed to save report to %s: %s", path, e)
-
-
-# ============================================================================
-# GStreamer Callback Functions
-# ============================================================================
+    except OSError as exc:
+        logger.error("Failed to save report to %s: %s", path, exc)
 
 
-def process_frame_detections(sink: Any) -> Gst.FlowReturn:
-    """Process Hailo detections and count bidirectional zone crossings.
+# ---------------------------------------------------------------------------
+# Per-track state
+# ---------------------------------------------------------------------------
 
-    Processes each frame's detections from Hailo, tracks object centroids,
-    and detects zone entries/exits by analyzing velocity across the zone
-    boundaries. Supports bidirectional counting (left-to-right and right-to-left).
+# track_id → {"in_zone": bool, "counted_entry": bool, "counted_exit": bool}
+_tracked: dict[int, dict[str, Any]] = {}
 
-    Entry/Exit Detection Logic:
-        - ENTRY: Object crosses zone boundary moving toward zone center
-        - EXIT: Object crosses zone boundary moving away from zone center
-        - Velocity threshold (VELOCITY_THRESHOLD pixels) prevents false counts
-        - Each object counted only once per crossing (state machine)
+# track_id → deque of recent centroid x-values (newest at right)
+_cx_history: dict[int, deque] = {}
 
-    Stale Track Cleanup:
-        - Removes tracked objects not detected for > TRACK_TIMEOUT_SEC
-        - Runs at STATS_LOG_INTERVAL_SEC interval
-        - Prevents memory accumulation over long runs
+# track_id → datetime of last detection (for stale-track cleanup)
+_last_seen: dict[int, datetime] = {}
 
-    Hourly Cloudflare Sync:
-        - Queued to background thread every UPLOAD_INTERVAL_SEC
-        - Never blocks the inference loop
+# Frame counter and timing for stats logging
+_frame_count: int = 0
+_last_log_time: float = time.monotonic()
+_last_upload_time: float = time.monotonic()
 
-    Args:
-        sink: GStreamer appsink element emitting sample signals
 
-    Returns:
-        Gst.FlowReturn: OK on successful processing, OK on error to continue
+# ---------------------------------------------------------------------------
+# GStreamer frame callback
+# ---------------------------------------------------------------------------
+
+
+def _on_new_sample(sink: Any) -> Gst.FlowReturn:
+    """Process one frame's Hailo detections and update zone crossing counts.
+
+    Called by GStreamer's appsink for every decoded frame.  Keeps all
+    per-track state in module-level dicts so no object allocation occurs
+    on the hot path beyond what Hailo returns.
+
+    Zone crossing logic
+    -------------------
+    Containment  : point_in_zone(cx, cy) — full 2-D polygon check via mask
+    Direction    : sign of velocity_x (horizontal centroid displacement)
+    Entry        : was outside → now inside, moving inward
+    Exit         : was inside  → now outside, moving outward
+    Latch reset  : flags reset when a track goes outside the zone so the
+                   same vehicle can be counted again on a subsequent pass
     """
-    global daily_stats, frame_count, last_log, last_upload
+    global daily_stats, _frame_count, _last_log_time, _last_upload_time
 
     sample = sink.emit("pull-sample")
     if sample is None:
         return Gst.FlowReturn.OK
 
-    frame_count += 1
-    buffer = sample.get_buffer()
+    _frame_count += 1
+    buf = sample.get_buffer()
 
     try:
-        roi = hailo.get_roi_from_buffer(buffer)
+        roi = hailo.get_roi_from_buffer(buf)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-        for detection in detections:
-            label: str = detection.get_label()
-            confidence: float = detection.get_confidence()
-
-            # Skip low-confidence detections
-            if confidence < CONF_THRESH:
+        for det in detections:
+            if det.get_confidence() < CONF_THRESH:
                 continue
 
-            # Extract unique tracking ID
-            unique_ids = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            if not unique_ids:
-                if IS_DEBUG:
-                    logger.debug("No unique_id for %s, skipping", label)
+            uid_list = det.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+            if not uid_list:
                 continue
+            tid: int = uid_list[0].get_id()
 
-            track_id: int = unique_ids[0].get_id()
+            bbox = det.get_bbox()
+            cx = int((bbox.xmin() + bbox.xmax()) / 2 * IMG_W)
+            cy = int((bbox.ymin() + bbox.ymax()) / 2 * IMG_H)
 
-            # Calculate centroid position from bounding box
-            bbox = detection.get_bbox()
-            cx: int = int((bbox.xmin() + bbox.xmax()) / 2 * IMG_W)
-            cy: int = int((bbox.ymin() + bbox.ymax()) / 2 * IMG_H)
-
-            # Validate centroid is within frame
             if not (0 <= cx < IMG_W and 0 <= cy < IMG_H):
                 continue
 
-            # Update last seen timestamp
-            track_last_seen[track_id] = datetime.now()
+            _last_seen[tid] = datetime.now()
 
-            # Initialize tracking state for new objects
-            if track_id not in tracked_zones:
-                tracked_zones[track_id] = {
-                    "zone": None,
-                    "entered": False,
-                    "exited": False,
+            # Initialise state for new tracks
+            if tid not in _tracked:
+                _tracked[tid] = {
+                    "in_zone": point_in_zone(cx, cy),
+                    "counted_entry": False,
+                    "counted_exit": False,
                 }
-            track_state = tracked_zones[track_id]
 
-            # Build centroid history for velocity calculation
-            history = centroid_history.get(
-                track_id,
-                deque(maxlen=CENTROID_HISTORY_SIZE),
-            )
+            state = _tracked[tid]
+
+            # Build x-history for velocity
+            history = _cx_history.setdefault(tid, deque(maxlen=CENTROID_HISTORY_SIZE))
             history.append(cx)
-            centroid_history[track_id] = history
 
-            # Detect crossing using velocity (x displacement between frames)
+            in_zone_now = point_in_zone(cx, cy)
+            was_in_zone = state["in_zone"]
+
             if len(history) >= 2:
-                prev_cx = history[-2]
-                velocity_x = cx - prev_cx
+                vx = history[-1] - history[-2]
 
-                # Zone lateral boundaries
-                zone_left = TRACKING_ZONE[0][0]
-                zone_right = TRACKING_ZONE[1][0]
+                # Reset latches when the object is clearly outside the zone
+                # so it can be counted again on a new approach.
+                if not in_zone_now:
+                    state["counted_entry"] = False
+                    state["counted_exit"] = False
 
-                # Position relative to zone
-                in_zone_now = zone_left <= cx <= zone_right
-                in_zone_prev = zone_left <= prev_cx <= zone_right
-
-                # ENTRY: Crossed left boundary rightward (left→right entry)
-                if not in_zone_prev and in_zone_now and velocity_x > VELOCITY_THRESHOLD:
-                    if not track_state["entered"]:
+                # ENTRY: outside → inside
+                if not was_in_zone and in_zone_now and abs(vx) > VELOCITY_THRESHOLD:
+                    if not state["counted_entry"]:
                         daily_stats["entries"] += 1
-                        track_state["entered"] = True
+                        state["counted_entry"] = True
                         logger.info(
-                            "➡️ ENTRY (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                            velocity_x,
+                            "➡️  ENTRY vx=%.1f cx=%d %s ID:%d conf=%.2f",
+                            vx,
                             cx,
-                            label,
-                            track_id,
-                            confidence,
+                            det.get_label(),
+                            tid,
+                            det.get_confidence(),
                         )
 
-                # EXIT RIGHT: Crossed right boundary rightward (left→right exit)
-                elif (
-                    in_zone_prev and not in_zone_now and velocity_x > VELOCITY_THRESHOLD
-                ):
-                    if not track_state["exited"]:
+                # EXIT: inside → outside
+                elif was_in_zone and not in_zone_now and abs(vx) > VELOCITY_THRESHOLD:
+                    if not state["counted_exit"]:
                         daily_stats["exits"] += 1
-                        track_state["exited"] = True
+                        state["counted_exit"] = True
                         logger.info(
-                            "➡️ EXIT (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                            velocity_x,
+                            "⬅️  EXIT  vx=%.1f cx=%d %s ID:%d conf=%.2f",
+                            vx,
                             cx,
-                            label,
-                            track_id,
-                            confidence,
+                            det.get_label(),
+                            tid,
+                            det.get_confidence(),
                         )
 
-                # EXIT LEFT: Crossed left boundary leftward (right→left exit)
-                elif (
-                    in_zone_prev
-                    and not in_zone_now
-                    and velocity_x < -VELOCITY_THRESHOLD
-                ):
-                    if not track_state["exited"]:
-                        daily_stats["exits"] += 1
-                        track_state["exited"] = True
-                        logger.info(
-                            "➡️ EXIT (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                            velocity_x,
-                            cx,
-                            label,
-                            track_id,
-                            confidence,
-                        )
+            state["in_zone"] = in_zone_now
 
-                # ENTRY LEFT: Crossed right boundary leftward (right→left entry)
-                elif (
-                    not in_zone_prev
-                    and in_zone_now
-                    and velocity_x < -VELOCITY_THRESHOLD
-                ):
-                    if not track_state["entered"]:
-                        daily_stats["entries"] += 1
-                        track_state["entered"] = True
-                        logger.info(
-                            "➡️ ENTRY (vx=%.1f cx=%d): %s ID:%d conf=%.2f",
-                            velocity_x,
-                            cx,
-                            label,
-                            track_id,
-                            confidence,
-                        )
-
-            # Update zone membership
-            track_state["zone"] = "in" if in_zone_now else "out"
-            tracked_zones[track_id] = track_state
-
-            # Debug tracking details
             if IS_DEBUG:
-                velocity_debug = (history[-1] - history[-2]) if len(history) >= 2 else 0
+                vx_debug = (history[-1] - history[-2]) if len(history) >= 2 else 0
                 logger.debug(
-                    "Track %d %s@%.2f zone=%s cx=%d vx=%.1f",
-                    track_id,
-                    label,
-                    confidence,
-                    track_state["zone"],
+                    "Track %d %s@%.2f in_zone=%s cx=%d vx=%.1f",
+                    tid,
+                    det.get_label(),
+                    det.get_confidence(),
+                    in_zone_now,
                     cx,
-                    velocity_debug,
+                    vx_debug,
                 )
 
-    except Exception as e:
+    except Exception as exc:  # noqa: BLE001
         if IS_DEBUG:
-            logger.exception("Detection processing error: %s", e)
-        # Continue processing even on error
+            logger.exception("Detection error: %s", exc)
 
-    # Periodic statistics reporting and stale track cleanup
-    now: float = time.monotonic()
-    if now - last_log >= STATS_LOG_INTERVAL_SEC:
-        # Calculate frame rate
-        time_delta = now - last_log
-        fps: float = frame_count / time_delta if time_delta > 0 else 0
+    # ------------------------------------------------------------------
+    # Periodic housekeeping
+    # ------------------------------------------------------------------
+    now = time.monotonic()
 
-        # Find and remove stale tracks
-        now_dt: datetime = datetime.now()
-        stale_ids: list[int] = [
-            tid
-            for tid, last_seen in track_last_seen.items()
-            if (now_dt - last_seen).total_seconds() > TRACK_TIMEOUT_SEC
+    if now - _last_log_time >= STATS_LOG_INTERVAL_SEC:
+        elapsed = now - _last_log_time
+        fps = _frame_count / elapsed if elapsed > 0 else 0.0
+
+        # Purge stale tracks
+        cutoff = datetime.now()
+        stale = [
+            t
+            for t, ts in _last_seen.items()
+            if (cutoff - ts).total_seconds() > TRACK_TIMEOUT_SEC
         ]
-        for tid in stale_ids:
-            tracked_zones.pop(tid, None)
-            track_last_seen.pop(tid, None)
-            centroid_history.pop(tid, None)
+        for t in stale:
+            _tracked.pop(t, None)
+            _cx_history.pop(t, None)
+            _last_seen.pop(t, None)
 
-        # Log statistics
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
             daily_stats["entries"],
             daily_stats["exits"],
             fps,
-            len(tracked_zones),
+            len(_tracked),
         )
-        last_log = now
-        frame_count = 0
+        _last_log_time = now
+        _frame_count = 0
 
-    # Hourly Cloudflare upload — queue only, returns instantly
-    if now - last_upload >= UPLOAD_INTERVAL_SEC:
+    # Hourly Cloudflare snapshot
+    if now - _last_upload_time >= UPLOAD_INTERVAL_SEC:
         _upload_queue.put(dict(daily_stats))
-        last_upload = now
+        _last_upload_time = now
         logger.info("📤 Hourly metrics queued for Cloudflare upload")
 
-    # Check for date rollover (midnight)
-    today: str = datetime.now().strftime("%Y-%m-%d")
+    # Midnight rollover
+    today = datetime.now().strftime("%Y-%m-%d")
     if daily_stats["date"] != today:
-        save_report()  # Saves JSON + queues final upload for the completed day
-        daily_stats["date"] = today
-        daily_stats["entries"] = 0
-        daily_stats["exits"] = 0
-        tracked_zones.clear()
-        track_last_seen.clear()
-        centroid_history.clear()
-        last_upload = now  # Reset hourly timer for new day
-        logger.info("🌅 New day started: %s", today)
+        _save_report()
+        daily_stats.update({"date": today, "entries": 0, "exits": 0})
+        _tracked.clear()
+        _cx_history.clear()
+        _last_seen.clear()
+        _last_upload_time = now
+        logger.info("🌅 New day: %s", today)
 
     return Gst.FlowReturn.OK
 
 
-# ============================================================================
-# Pipeline Construction
-# ============================================================================
+# ---------------------------------------------------------------------------
+# GStreamer pipeline
+# ---------------------------------------------------------------------------
 
 
-def build_pipeline_string(
-    rtsp_url: str,
-    hef_path: str,
-    width: int,
-    height: int,
-    subtype: int,
-) -> str:
-    """Build GStreamer pipeline string for Hailo YOLOv8 inference.
+def _build_pipeline(rtsp_url: str) -> str:
+    """Return the GStreamer pipeline launch string.
 
-    Constructs a complex GStreamer pipeline for:
-        1. RTSP video capture from IP camera
-        2. Decoding (H.264 or H.265 based on subtype)
-        3. Scaling to target resolution
-        4. Hailo preprocessing (cropping, normalization)
-        5. YOLOv8 inference on Hailo accelerator
-        6. Post-processing (YOLO COCO format)
-        7. Object tracking with Kalman filter
-        8. Frame-by-frame delivery to Python callback
-
-    Args:
-        rtsp_url: RTSP stream URL from camera
-        hef_path: Path to Hailo Executable Format (.hef) model file
-        width: Target frame width for inference
-        height: Target frame height for inference
-        subtype: RTSP stream subtype (0=H.265 main, 1=H.264 substream)
-
-    Returns:
-        str: Complete GStreamer pipeline launch string
-
-    Notes:
-        - H.264 used for substream (1), H.265 for main stream (0)
-        - Codec-specific decoders and depayloaders selected based on subtype
-        - Video max threads limited to VIDEO_MAX_THREADS for efficiency
-        - Hailo tracker uses Kalman distance threshold and IOU threshold
+    Design notes
+    ------------
+    * hailocropper runs WITHOUT so-path — the default passthrough/whole-buffer
+      mode works with hailo-all / hailo-tappas-core and does NOT require a
+      full TAPPAS source build (libwhole_buffer.so).  See TROUBLESHOOTING.md
+      section 5.3.
+    * RTSP latency is 300 ms (local network).  The original 2000 ms added
+      unnecessary startup delay.
+    * H.264 substream (SUBTYPE=1) uses software avdec_h264 capped at
+      H264_MAX_THREADS.  H.265 main stream (SUBTYPE=0) uses the RPi5
+      hardware v4l2slh265dec — no thread cap needed.
+    * appsink drops oldest buffers under load (drop=true) to prevent
+      back-pressure stalling the pipeline.
     """
-    # Select appropriate decoder based on stream subtype
-    if subtype == 1:
-        # H.264 substream decoding (software — low resolution, cheap)
-        decoder = (
-            f"rtph264depay ! h264parse ! avdec_h264 max-threads={VIDEO_MAX_THREADS}"
+    if SUBTYPE == 1:
+        decode = (
+            f"rtph264depay ! h264parse ! " f"avdec_h264 max-threads={H264_MAX_THREADS}"
         )
     else:
-        # H.265 main stream — hardware decode via RPi5 HEVC engine
-        # h265parse must output byte-stream for v4l2slh265dec
-        # videoconvert handles NV12 → RGB for Hailo downstream
-        decoder = (
-            "rtph265depay ! "
-            "h265parse ! video/x-h265,stream-format=byte-stream,alignment=au ! "
+        decode = (
+            "rtph265depay ! h265parse ! "
+            "video/x-h265,stream-format=byte-stream,alignment=au ! "
             "v4l2slh265dec ! video/x-raw,format=NV12"
         )
 
-    # Construct complete GStreamer pipeline string
-    # Multi-branch structure: source→cropper splits into reference and inference paths,
-    # aggregated, then tracked and output to appsink
-    #
-    # Pipeline segments:
-    # 1. Source and preprocessing (RTSP → decode → scale → cropper)
-    # 2. Aggregator element (combines reference and detection paths)
-    # 3. Reference branch (cropper pad 0 → agg.sink_0)
-    # 4. Detection branch (cropper pad 1 → inference → agg.sink_1)
-    # 5. Output branch (agg → tracker → appsink)
-    parts = [
-        (
-            f'rtspsrc location="{rtsp_url}" '
-            f"latency={RTSP_LATENCY_MS} buffer-mode=auto protocols=tcp "
-            f"drop-on-latency=true timeout={RTSP_TIMEOUT_US} name=src ! "
-            f"application/x-rtp,media=video ! {decoder} ! "
-            f"videoconvert ! video/x-raw,format=RGB ! "
-            f"videoscale ! video/x-raw,width={width},height={height} ! "
-            f"hailocropper name=cropper "
-            f"so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so "
-            f"function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true"
-        ),
-        "hailoaggregator name=agg",
-        "cropper. ! queue ! agg.sink_0",
-        (
-            "cropper. ! queue ! videoconvert ! "
-            f"hailonet hef-path={hef_path} batch-size={HAILO_BATCH_SIZE} ! "
-            f"hailofilter "
-            f"so-path=/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so "
-            f"config-path=/usr/local/hailo/resources/barcode_labels/coco_80.json "
-            f"function-name=filter qos=false ! queue ! agg.sink_1"
-        ),
-        (
-            "agg. ! queue ! "
-            f"hailotracker name=tracker class-id=-1 "
-            f"kalman-dist-thr={KALMAN_DIST_THR} iou-thr={IOU_THR} "
-            f"init-iou-thr={INIT_IOU_THR} "
-            f"keep-tracked-frames={KEEP_TRACKED_FRAMES} keep-lost-frames={KEEP_LOST_FRAMES} "
-            f"qos=false ! queue ! "
-            f"appsink name=sink emit-signals=true sync=false "
-            f"max-buffers={APPSINK_MAX_BUFFERS} drop={str(APPSINK_DROP_MODE).lower()}"
-        ),
-    ]
-
-    pipeline = " ".join(parts)
-    return pipeline
+    return " ".join(
+        [
+            # Source
+            f'rtspsrc location="{rtsp_url}"'
+            f" latency={RTSP_LATENCY_MS}"
+            f" buffer-mode=auto protocols=tcp"
+            f" drop-on-latency=true timeout={RTSP_TIMEOUT_US} name=src !",
+            f"application/x-rtp,media=video ! {decode} !",
+            f"videoconvert ! video/x-raw,format=RGB !",
+            f"videoscale ! video/x-raw,width={IMG_W},height={IMG_H} !",
+            # Hailo preprocessing — no so-path needed for whole-buffer crop
+            "hailocropper name=cropper"
+            " use-letterbox=true resize-method=inter-area internal-offset=true",
+            # Aggregator collects both branches
+            "hailoaggregator name=agg",
+            # Branch 0: passthrough reference frames
+            "cropper. ! queue leaky=downstream max-size-buffers=2 ! agg.sink_0",
+            # Branch 1: inference
+            "cropper. ! queue leaky=downstream max-size-buffers=2 ! videoconvert !",
+            f"hailonet hef-path={HEF_MODEL_PATH} batch-size={HAILO_BATCH_SIZE} !",
+            f"hailofilter so-path={YOLO_POST_SO}"
+            f" config-path={COCO_LABELS_JSON}"
+            f" function-name=filter qos=false !",
+            "queue leaky=downstream max-size-buffers=2 ! agg.sink_1",
+            # Tracker + output
+            "agg. ! queue leaky=downstream max-size-buffers=2 !",
+            f"hailotracker name=tracker class-id=-1"
+            f" kalman-dist-thr={KALMAN_DIST_THR}"
+            f" iou-thr={IOU_THR}"
+            f" init-iou-thr={INIT_IOU_THR}"
+            f" keep-tracked-frames={KEEP_TRACKED_FRAMES}"
+            f" keep-lost-frames={KEEP_LOST_FRAMES}"
+            f" qos=false !",
+            "queue leaky=downstream max-size-buffers=2 !",
+            f"appsink name=sink emit-signals=true sync=false"
+            f" max-buffers={APPSINK_MAX_BUFFERS}"
+            f" drop={str(APPSINK_DROP).lower()}",
+        ]
+    )
 
 
-def on_bus_message(bus: Any, message: Any, loop: Any) -> None:
-    """Handle GStreamer bus messages for error and end-of-stream events.
-
-    Monitors the GStreamer pipeline bus for critical messages (ERROR, EOS)
-    and terminates the main event loop gracefully on error or stream end.
-
-    Args:
-        bus: GStreamer Bus object from the pipeline
-        message: GStreamer Message object from the bus
-        loop: GLib.MainLoop instance to control application lifecycle
-
-    Returns:
-        None
-    """
-    msg_type: Gst.MessageType = message.type
-
-    if msg_type == Gst.MessageType.ERROR:
-        err, debug = message.parse_error()
-        logger.error(f"GStreamer error: {err}")
-        if debug:
-            logger.debug(f"Debug info: {debug}")
+def _on_bus_message(bus: Any, message: Any, loop: GLib.MainLoop) -> None:
+    """Handle GStreamer ERROR and EOS bus messages."""
+    if message.type == Gst.MessageType.ERROR:
+        err, dbg = message.parse_error()
+        logger.error("GStreamer error: %s", err)
+        if dbg:
+            logger.debug("GStreamer debug: %s", dbg)
         loop.quit()
-
-    elif msg_type == Gst.MessageType.EOS:
-        logger.info("End of stream reached")
+    elif message.type == Gst.MessageType.EOS:
+        logger.info("End of stream")
         loop.quit()
 
 
-# ============================================================================
-# Main Application
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
-    """Start driveway counter with Hailo inference and GStreamer pipeline.
-
-    This function:
-        1. Starts the background Cloudflare upload thread
-        2. Validates configuration and model file existence
-        3. Initializes GStreamer and constructs the inference pipeline
-        4. Connects detection callbacks to process Hailo inference results
-        5. Runs the main event loop for continuous frame processing
-        6. Handles graceful shutdown with report saving and thread cleanup
-
-    The application will:
-        - Connect to RTSP camera stream using credentials from environment
-        - Process frames through YOLOv8 inference on Hailo accelerator
-        - Track objects across frames and detect zone boundary crossings
-        - Log entry/exit events with detection confidence
-        - Report statistics every STATS_LOG_INTERVAL_SEC seconds
-        - Upload metrics to Cloudflare every UPLOAD_INTERVAL_SEC via background thread
-        - Save daily JSON report and roll over statistics at midnight
+    """Initialise pipeline, run event loop, shut down cleanly.
 
     Returns:
-        int: Exit code
-            0 = Successful completion or keyboard interrupt
-            1 = Configuration error or pipeline initialization failure
+        0 on clean exit or keyboard interrupt
+        1 on configuration / pipeline error
     """
-    logger.info("🚗 Driveway Counter (Hailo 26 TOPS)")
-    logger.info("📍 Tracking Zone: %s", TRACKING_ZONE.tolist())
+    logger.info("🚗 Driveway Counter (Hailo-8 26 TOPS)")
+    logger.info("📍 Tracking Zone (processing res): %s", TRACKING_ZONE.tolist())
     logger.info(
-        "📋 Original resolution: %dx%d | Processing resolution: %dx%d",
+        "📋 Original %dx%d → processing %dx%d",
         ORIG_W,
         ORIG_H,
         IMG_W,
         IMG_H,
     )
+    logger.info("📊 Confidence threshold: %.2f", CONF_THRESH)
+    logger.info(
+        "📈 Tracking: timeout=%ds  velocity_thr=%dpx",
+        TRACK_TIMEOUT_SEC,
+        VELOCITY_THRESHOLD,
+    )
 
-    # Start background Cloudflare upload thread
+    # Preflight checks
+    for label, path in [
+        ("HEF model", HEF_MODEL_PATH),
+        ("YOLO postprocess SO", YOLO_POST_SO),
+        ("COCO labels JSON", COCO_LABELS_JSON),
+    ]:
+        if not os.path.exists(path):
+            logger.error("❌ %s not found: %s", label, path)
+            return 1
+
+    # Background Cloudflare upload thread
     upload_thread = threading.Thread(
         target=_cloudflare_upload_worker,
-        name="cloudflare-uploader",
+        name="cf-uploader",
         daemon=True,
     )
     upload_thread.start()
@@ -759,124 +637,65 @@ def main() -> int:
         "☁️  Cloudflare upload thread started (interval=%ds)", int(UPLOAD_INTERVAL_SEC)
     )
 
-    # Initialize GStreamer library
+    # GStreamer init
     try:
         Gst.init(None)
-    except Exception as e:
-        logger.error("Failed to initialize GStreamer: %s", e)
+    except Exception as exc:
+        logger.error("GStreamer init failed: %s", exc)
         return 1
 
-    # Build RTSP URL with URL-encoded credentials (security: no plaintext in logs)
-    username_enc: str = quote(USERNAME, safe="")
-    password_enc: str = quote(PASSWORD, safe="")
-    rtsp_url: str = (
-        f"rtsp://{username_enc}:{password_enc}@{IPADDRESS}:554"
+    rtsp_url = (
+        f"rtsp://{quote(USERNAME, safe='')}:{quote(PASSWORD, safe='')}"
+        f"@{IPADDRESS}:554"
         f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
     )
 
-    # Log configuration
-    logger.info("✅ Model: %s", HEF_MODEL_PATH)
-    logger.info("📊 Confidence threshold: %.2f", CONF_THRESH)
-    logger.info(
-        "📈 Tracking: timeout=%ds, velocity_thr=%d px",
-        TRACK_TIMEOUT_SEC,
-        VELOCITY_THRESHOLD,
-    )
-
-    # Validate model file exists before pipeline creation
-    if not os.path.exists(HEF_MODEL_PATH):
-        logger.error("❌ HEF model not found: %s", HEF_MODEL_PATH)
-        return 1
-
-    # Build GStreamer pipeline from configuration
+    # Build and start pipeline
     pipeline: Gst.Pipeline | None = None
-    try:
-        pipeline_str: str = build_pipeline_string(
-            rtsp_url,
-            HEF_MODEL_PATH,
-            IMG_W,
-            IMG_H,
-            SUBTYPE,
-        )
-        pipeline: Gst.Pipeline = Gst.parse_launch(pipeline_str)
-        logger.debug("Pipeline created successfully")
-    except Exception as e:
-        logger.error("❌ Pipeline creation failed: %s", e)
-        if IS_DEBUG:
-            logger.exception("Full traceback:")
-        return 1
+    loop: GLib.MainLoop | None = None
 
-    # Connect Python callback to GStreamer appsink element
     try:
-        sink: Any = pipeline.get_by_name("sink")
+        pipeline_str = _build_pipeline(rtsp_url)
+        logger.debug("Pipeline:\n%s", pipeline_str)
+
+        pipeline = Gst.parse_launch(pipeline_str)
+
+        sink = pipeline.get_by_name("sink")
         if sink is None:
-            logger.error("❌ Could not find 'sink' element in pipeline")
+            logger.error("❌ appsink element 'sink' not found in pipeline")
             return 1
-        sink.connect("new-sample", process_frame_detections)
-        logger.debug("Connected sample callback to appsink")
-    except Exception as e:
-        logger.error("❌ Failed to connect callback: %s", e)
-        return 1
+        sink.connect("new-sample", _on_new_sample)
 
-    # Set up GStreamer bus for error/EOS handling
-    bus: Gst.Bus = pipeline.get_bus()
-    bus.add_signal_watch()
+        loop = GLib.MainLoop()
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", lambda b, m: _on_bus_message(b, m, loop))
 
-    # Create main event loop
-    loop: GLib.MainLoop = GLib.MainLoop()
-
-    # Define bus message handler with loop reference
-    def bus_message_handler(bus: Any, message: Any) -> None:
-        """Wrapper to pass loop instance to on_bus_message."""
-        on_bus_message(bus, message, loop)
-
-    bus.connect("message", bus_message_handler)
-
-    # Start pipeline (transition to PLAYING state)
-    logger.info("🚀 Starting GStreamer pipeline...")
-    try:
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("❌ Failed to start pipeline")
+            logger.error("❌ Pipeline failed to enter PLAYING state")
             return 1
-        logger.info("✅ Pipeline running, processing frames...")
-    except Exception as e:
-        logger.error("❌ Pipeline start failed: %s", e)
-        return 1
 
-    # Run main event loop (blocks until quit signal or error)
-    try:
+        logger.info("🚀 Pipeline running — press Ctrl+C to stop")
         loop.run()
+
     except KeyboardInterrupt:
-        logger.info("⊛ Keyboard interrupt (CTRL+C) received")
-        return 0
-    except Exception as e:
-        logger.error("❌ Main loop error: %s", e)
+        logger.info("Keyboard interrupt received")
+    except Exception as exc:
+        logger.error("Fatal error: %s", exc)
         if IS_DEBUG:
-            logger.exception("Full traceback:")
+            logger.exception("Traceback:")
         return 1
     finally:
-        # Guaranteed cleanup on any exit path
-
-        # Stop GStreamer pipeline
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
-
-        # Save final report (also queues one last Cloudflare upload)
-        save_report()
-
-        # Drain upload queue cleanly before exit
-        _upload_queue.put(None)  # Sentinel signals worker thread to exit
+        _save_report()
+        _upload_queue.put(None)  # sentinel — tells worker to exit
         upload_thread.join(timeout=15)
-        logger.info("✅ Application shutdown complete")
+        logger.info("✅ Shutdown complete")
 
     return 0
 
 
-# ============================================================================
-# Application Entry Point
-# ============================================================================
-
-
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())

@@ -1,413 +1,370 @@
-# Hailo-8 AI Accelerator on Raspberry Pi 5 - Troubleshooting & Restoration Guide
+# Hailo-8 on Raspberry Pi 5 — Troubleshooting & Restoration Guide
 
-This document provides a step-by-step restoration guide for the Hailo-8 AI HAT on the Raspberry Pi 5. Use this guide when:
+Use this guide when:
 
-- The kernel driver is lost after a system/kernel update.
-- `hailortcli scan` stops seeing the device.
-- The driveway-counter GStreamer pipeline crashes with Hailo errors or segfaults.
+- The app crashes with `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` or segfaults on launch
+- `hailortcli scan` stops finding the device after a system update
+- The GStreamer pipeline fails to start or produces no detections
+- The kernel driver is lost after a kernel update
 
-This guide is specific to **Hailo-8 on Raspberry Pi 5** using the **driveway-counter** application.
-
----
-
-## Specs & Known-Good Stack
-
-- **Hardware:** Raspberry Pi 5 with Hailo-8 AI HAT (26 TOPS).  
-  *Note: This is NOT the Hailo-10 (which uses `hailo1x_pci.ko`).*
-- **Kernel driver:** `hailo_pci.ko` built from `hailort-drivers` **v4.19.0**.
-- **User-space stack (APT):**
-  - `hailo-all` (includes `hailort`, GStreamer plugins, examples, etc.).
-  - `hailo-tappas-core` (core TAPPAS libs; full TAPPAS source build is *not* required for this app).
-- **Python module:**  
-  `/usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so` (Python 3.13).
-- **GStreamer plugins required:**
-  - `hailonet`, `hailofilter`, `hailocropper`, `hailoaggregator`, `hailotracker`.[web:344][web:351]
-
-### Version mismatch notes
-
-- If you see:
-
-  ```text
-  [HailoRT] [error] Failed to query driver info with HAILO_DRIVER_INVALID_IOCTL(86)
-  HAILO_INVALID_DRIVER_VERSION(76)
-  ```
-
-  when running `hailortcli` tools, that indicates a mismatch between the `hailo_pci` kernel module and the installed user-space `hailort` library.[file:360]
-
-- For this setup, the following has been validated to work:
-
-  - **Kernel driver:** `v4.19.0` from `hailort-drivers`  
-  - **User space:** `hailo-all` (HailoRT `4.23.0`)
-
-  Minor IOCTL/version warnings are acceptable **as long as**:
-  - `hailortcli fw-control identify` succeeds, and
-  - The GStreamer pipeline runs without segfaults.[file:360]
+**Hardware:** Raspberry Pi 5 + Hailo-8 AI HAT (26 TOPS)  
+**Not applicable to:** Hailo-10 (`hailo1x_pci` driver)
 
 ---
 
-## 1. Symptoms of Driver / Device Failure
+## Known-Good Stack
 
-Use this section when the hardware itself disappears or the kernel module is broken.
-
-- `hailortcli scan` returns:
-
-  ```text
-  Hailo Devices:
-  [-]  No devices found.
-  ```
-
-- `ls -l /dev/hailo*` returns `No such file or directory`.
-- `sudo modprobe hailo_pci` returns:
-
-  ```text
-  modprobe: FATAL: Module hailo_pci not found
-  ```
-
-- `dmesg` shows Hailo-related errors on boot or after plugging the HAT.
-- The driveway-counter app fails very early, before any GStreamer output, or segfaults immediately.
+| Component | Version |
+|---|---|
+| Kernel driver | `hailo_pci.ko` from `hailort-drivers` **v4.19.0** |
+| User-space | `hailo-all` (HailoRT 4.23.0) |
+| Python module | `hailo.cpython-313-aarch64-linux-gnu.so` (Python 3.13) |
+| GStreamer plugins | `hailonet`, `hailofilter`, `hailocropper`, `hailoaggregator`, `hailotracker` |
 
 ---
 
-## 2. Kernel Driver Restoration (Hailo-8 Only)
+## Quick Diagnosis Checklist
 
-If the driver is lost or corrupted, **do not** rely on DKMS or the `hailo-rpi5-examples` install script if they repeatedly fail. Instead, manually compile the `v4.19.0` driver from the exact repository.
-
-### Step 2.1: (Optional but Dangerous) Purge Broken Kernel Modules
-
-Only use this if the system is in a badly broken state and you know what you’re doing. It will also remove user-space Hailo packages, which must then be reinstalled.
+Run these before diving into individual sections:
 
 ```bash
-sudo apt purge 'hailo*' 'hailort*' 'h10-*' 'h8-*' dkms -y
-sudo apt autoremove -y
-sudo rm -rf /lib/modules/$(uname -r)/kernel/drivers/misc/hailo*
-sudo depmod -a
+# 1. Is the device node present?
+ls -l /dev/hailo*
+
+# 2. Is the correct driver loaded? (only hailo_pci should appear)
+lsmod | grep hailo
+
+# 3. Does HailoRT see the device?
+hailortcli scan
+
+# 4. Can HailoRT talk to the firmware?
+hailortcli fw-control identify
+
+# 5. Is anything already holding the device open?
+sudo fuser -v /dev/hailo0
 ```
 
-> **Note:** After this purge you *must* reinstall `hailo-all` later (see section 4). Avoid this step unless absolutely necessary.[file:360]
+---
 
-### Step 2.2: Clone the Hailo Drivers Repository
+## Issue 1: `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` + Segfault
 
-The kernel drivers are in `hailort-drivers`, **not** the main `hailort` repo.
+This is the most common error. There are three distinct causes — check them in order.
+
+### Cause A: systemd service already running (most common)
+
+The service is configured with `Restart=always`. After any crash it respawns within 10 seconds and reclaims `/dev/hailo0`. Any manual launch while the service is active will immediately fail with this error.
+
+```bash
+# Check
+sudo systemctl status driveway-counter.service
+
+# Fix — stop the service before any manual run
+sudo systemctl stop driveway-counter.service
+python3 driveway_counter_hailo.py
+
+# When done debugging, restart the service
+sudo systemctl start driveway-counter.service
+```
+
+**Standard debug workflow:**
+```bash
+sudo systemctl stop driveway-counter.service
+source .venv/bin/activate
+python3 driveway_counter_hailo.py
+# ... debug ...
+sudo systemctl start driveway-counter.service
+```
+
+### Cause B: Stale process holding the device
+
+A crashed GStreamer pipeline can leave a Python process alive that keeps `/dev/hailo0` open even after the app appears to have exited.
+
+```bash
+# Find the process
+sudo fuser -v /dev/hailo0
+
+# Kill it
+sudo fuser -k /dev/hailo0
+sleep 2
+
+# Verify device is free (use_count should be 0)
+lsmod | grep hailo
+# Expected: hailo_pci   147456  0
+```
+
+### Cause C: Two Hailo drivers loaded simultaneously
+
+A system update may load `hailo1x_pci` (the Hailo-10 driver) alongside `hailo_pci` (the Hailo-8 driver). They fight over the device.
+
+```bash
+# Check
+lsmod | grep hailo
+# If you see BOTH hailo_pci AND hailo1x_pci, that is the problem
+
+# Immediate fix
+sudo rmmod hailo1x_pci
+
+# Permanent fix — blacklist the Hailo-10 driver
+echo "blacklist hailo1x_pci" | sudo tee /etc/modprobe.d/hailo-blacklist.conf
+sudo update-initramfs -u
+```
+
+After a reboot, `lsmod | grep hailo` should show only `hailo_pci`.
+
+---
+
+## Issue 2: Driver Lost After Kernel Update
+
+Symptoms:
+- `ls -l /dev/hailo*` → `No such file or directory`
+- `sudo modprobe hailo_pci` → `Module hailo_pci not found`
+- `hailortcli scan` → `No devices found`
+
+The kernel update built a new kernel image and the old DKMS module no longer matches. Rebuild the driver from source.
+
+### Step 1 — Clone and checkout the stable tag
 
 ```bash
 cd /tmp
 git clone https://github.com/hailo-ai/hailort-drivers.git
 cd hailort-drivers
-```
-
-### Step 2.3: Checkout Stable Version (v4.19.0)
-
-```bash
 git checkout v4.19.0
 ```
 
-> If you see `hailo1x_pci.ko` during build, you are on a Hailo-10 branch/tag — switch back to `v4.19.0`.[file:360]
+> If you see `hailo1x_pci.ko` during the build you are on the wrong branch. `v4.19.0` builds `hailo_pci.ko` for Hailo-8 only.
 
-### Step 2.4: Compile the Driver for Hailo-8
+### Step 2 — Build
 
 ```bash
 cd linux/pcie
-make clean
-make all
-```
-
-Verify the resulting module:
-
-```bash
+make clean && make all
 find . -name "hailo_pci.ko"
 # Expected: ./build/release/aarch64/hailo_pci.ko
 ```
 
-### Step 2.5: Install and Load the Kernel Module
+### Step 3 — Install
 
 ```bash
 sudo mkdir -p /lib/modules/$(uname -r)/kernel/drivers/misc/
-sudo cp build/release/aarch64/hailo_pci.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
+sudo cp build/release/aarch64/hailo_pci.ko \
+  /lib/modules/$(uname -r)/kernel/drivers/misc/
 sudo depmod -a
 sudo modprobe hailo_pci
-```
-
----
-
-## 3. Basic Device Verification
-
-Run these as the normal `pi` user (no venv needed):
-
-```bash
-ls -l /dev/hailo*
-# Expected: crw-rw-rw- 1 root root 508, 0 ... /dev/hailo0 (permissions may vary)
-
 hailortcli scan
-# Expected:
-# Hailo Devices:
-# [-] Device: 0001:01:00.0
-
-hailortcli fw-control identify
-# Expected: Hailo-8, firmware 4.23.0, etc.
+# Expected: Device: 0001:01:00.0
 ```
-
-If `scan` and `fw-control identify` both succeed, the **kernel driver and firmware are OK**.
-
-If `hailortcli fw-control identify` fails with version/IOCTL errors but `scan` works, treat it as a **driver/library mismatch**; confirm you’re on `hailo-all` that is compatible with your driver build or recompile driver from the matching `hailort-drivers` tag.
 
 ---
 
-## 4. User-Space Hailo Stack & Python venv
+## Issue 3: "AvgDets: 0.0" — No Detections
 
-The driveway-counter app runs under **Python 3.13** in a virtual environment and relies on the system-installed Hailo Python extension.[file:335]
-
-### Step 4.1: Ensure Hailo User-Space Packages Are Installed
-
-After any purge or OS upgrade, reinstall:
+### Check 1: Confidence threshold too high
 
 ```bash
-sudo apt update
-sudo apt install hailo-all -y
+grep CONF_THRESH .env
+# Try lowering to 0.25 for testing
 ```
 
-This provides:
-
-- `/usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so`
-- GStreamer elements: `hailonet`, `hailofilter`, `hailocropper`, `hailoaggregator`, `hailotracker`, etc.[web:341][web:351]
-
-Verify the Python module:
-
-```bash
-find /usr/lib/python3/dist-packages -maxdepth 1 -name "hailo*"
-# Expect:
-# /usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so
-# plus hailo_platform, hailort-*.egg-info, etc.
-```
-
-### Step 4.2: Virtualenv Creation (with system-site-packages)
-
-In `/mnt/ssd/projects/driveway-counter`:
-
-```bash
-python3 -m venv .venv --system-site-packages
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Check `pyvenv.cfg`:
-
-```text
-include-system-site-packages = true
-version = 3.13.5
-```
-
-### Step 4.3: Fix “Hailo Python module not found” in venv
-
-If you still see:
-
-```text
-Hailo Python module not found. Ensure venv uses --system-site-packages. Error: No module named 'hailo'
-```
-
-even though `hailo-all` is installed, explicitly add `dist-packages` into the venv’s site-packages:
-
-```bash
-echo "/usr/lib/python3/dist-packages" > .venv/lib/python3.13/site-packages/system_packages.pth
-```
-
-Then:
+### Check 2: Hailo Python module not loading
 
 ```bash
 source .venv/bin/activate
 python3 -c "import hailo; print(hailo.__file__)"
-# Should print: /usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so
+# Expected: /usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so
+```
+
+If this fails, see **Issue 5** below.
+
+### Check 3: hailofilter not in pipeline
+
+```bash
+grep "hailofilter" driveway_counter_hailo.py
+# Must be present — it runs YOLO NMS postprocessing
+```
+
+### Check 4: Test with gst-launch
+
+```bash
+# URL-encode any special characters in the password
+gst-launch-1.0 \
+  rtspsrc location="rtsp://user:pass@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" \
+  latency=300 protocols=tcp ! \
+  rtph264depay ! h264parse ! avdec_h264 ! \
+  videoscale ! video/x-raw,width=704,height=480 ! \
+  videoconvert ! video/x-raw,format=RGB ! \
+  hailocropper use-letterbox=true resize-method=inter-area internal-offset=true ! \
+  hailonet hef-path=./models/yolov8m.hef batch-size=1 ! \
+  fakesink
 ```
 
 ---
 
-## 5. GStreamer / Hailo Pipeline Checks
+## Issue 4: `hailocropper` Pipeline Error / `libwhole_buffer.so` Not Found
 
-The driveway-counter app uses a GStreamer pipeline that depends on Hailo plugins and a YOLO postprocess `.so`.[file:335]
+The original hailo-rpi5-examples documentation references:
+```
+so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so
+```
 
-### Step 5.1: Verify Hailo GStreamer plugins
+**Do not use this path.** `libwhole_buffer.so` is only present after a full TAPPAS source build, which is not required for this application. Running `hailocropper` without `so-path` uses the built-in whole-buffer passthrough mode, which works correctly with `hailo-all` / `hailo-tappas-core`.
+
+The current `driveway_counter_hailo.py` does not set `so-path` on `hailocropper`. If you see this path in any version of the script, remove it.
+
+---
+
+## Issue 5: "Hailo Python Module Not Found" in venv
 
 ```bash
+# Reinstall user-space packages
+sudo apt update && sudo apt install hailo-all -y
+
+# Re-create the dist-packages pointer
+echo "/usr/lib/python3/dist-packages" \
+  > .venv/lib/python3.13/site-packages/system_packages.pth
+
+# Verify
+source .venv/bin/activate
+python3 -c "import hailo; print(hailo.__file__)"
+```
+
+If the file at `/usr/lib/python3/dist-packages/hailo.cpython-313-*.so` does not exist after reinstalling `hailo-all`, your Python version may have changed. Check:
+
+```bash
+python3 --version
+ls /usr/lib/python3/dist-packages/hailo*.so
+```
+
+The `.so` filename must match your Python version.
+
+---
+
+## Issue 6: "ImportError: No module named 'gi'"
+
+The venv was created without `--system-site-packages`. GStreamer Python bindings are system packages and cannot be installed via pip.
+
+```bash
+rm -rf .venv
+python3 -m venv .venv --system-site-packages
+echo "/usr/lib/python3/dist-packages" \
+  > .venv/lib/python3.13/site-packages/system_packages.pth
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## Issue 7: "Track ID Is None"
+
+`hailotracker` is missing from the pipeline or misconfigured.
+
+Verify the pipeline string in `driveway_counter_hailo.py` contains:
+```
+hailotracker name=tracker class-id=-1 kalman-dist-thr=0.9 iou-thr=0.65
+  init-iou-thr=0.7 keep-tracked-frames=15 keep-lost-frames=5 qos=false
+```
+
+---
+
+## Issue 8: RTSP Connection Failed
+
+```bash
+# 1. Test network
+ping 192.168.1.100
+
+# 2. Test RTSP directly (URL-encode special characters in password)
+ffmpeg -rtsp_transport tcp \
+  -i "rtsp://user:pass@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1" \
+  -frames:v 1 -y /tmp/test.jpg
+
+# 3. Verify camera web interface
+curl -u username:password http://192.168.1.100
+```
+
+If the password contains special characters (`@`, `#`, `!`, etc.), they must be URL-encoded in the RTSP URL. The app handles this automatically via `urllib.parse.quote`.
+
+---
+
+## Issue 9: FPS Below 10
+
+```bash
+# Check CPU temperature (throttling starts around 80°C)
+vcgencmd measure_temp
+
+# Check CPU clock speed
+vcgencmd measure_clock arm
+
+# Check overall load
+htop
+```
+
+Expected at steady state: ~15 FPS, ~7% CPU, ~50°C, ~190 MB RAM with the H.264 substream (SUBTYPE=1). The H.265 main stream (SUBTYPE=0) pushes CPU to 100% — use the substream.
+
+---
+
+## Issue 10: Cloudflare Sync Failed
+
+```bash
+# 1. Verify both values are set
+grep -E "WORKER_URL|CLOUDFLARE_TOKEN" .env
+
+# 2. Test the endpoint manually
+curl -X POST https://YOUR_WORKER.workers.dev/api/metrics \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"driveway:2026-01-01","value":{"date":"2026-01-01","entries":1,"exits":1}}'
+# Expected response: Metrics stored OK
+
+# 3. Test read endpoints
+curl https://YOUR_WORKER.workers.dev/today
+curl https://YOUR_WORKER.workers.dev/hourly
+```
+
+Cloudflare failures are logged but never crash the counter. The inference pipeline continues regardless.
+
+---
+
+## Issue 11: Intraday Chart Empty on Dashboard
+
+The hourly chart only populates after the first upload, which happens one hour after the counter starts. Check the logs for:
+
+```
+📤 Hourly metrics queued for Cloudflare upload
+Metrics synced to Cloudflare: YYYY-MM-DD
+```
+
+If neither line appears, verify `UPLOAD_INTERVAL_SEC = 3600.0` in the script and that the Cloudflare upload thread started (`☁️  Cloudflare upload thread started` in startup logs).
+
+---
+
+## Full Sanity Checklist
+
+When everything seems broken after an update, walk this list top to bottom:
+
+```bash
+# 1. Driver
+ls -l /dev/hailo*
+lsmod | grep hailo          # only hailo_pci, no hailo1x_pci
+hailortcli scan
+hailortcli fw-control identify
+
+# 2. User-space packages
+dpkg -l | grep hailo
 gst-inspect-1.0 | grep hailo
-```
 
-You should see entries including:
+# 3. Service / process conflicts
+sudo systemctl stop driveway-counter.service
+sudo fuser -k /dev/hailo0 2>/dev/null
 
-- `hailo: hailonet`
-- `hailotools: hailofilter`
-- `hailotools: hailocropper`
-- `hailotools: hailoaggregator`
-- `hailotools: hailotracker`[web:351]
+# 4. Python environment
+cd /mnt/ssd/projects/driveway-counter
+source .venv/bin/activate
+python3 -c "import hailo; import gi; print('OK')"
 
-If `hailonet` / `hailofilter` / `hailocropper` are missing, reinstall:
-
-```bash
-sudo apt install hailo-tappas-core -y
-```
-
-*(Full TAPPAS source install is **not required** for this app — only the core libs and plugins.)*[web:356]
-
-### Step 5.2: Model & Postprocess Library Paths
-
-The application expects:
-
-- Model (symlinked by `setup_hailo.sh`):
-
-  ```bash
-  ./models/yolov8m.hef  ->  /usr/local/hailo/resources/models/hailo8/yolov8m.hef
-  ```
-
-- YOLO postprocess `.so`:
-
-  ```bash
-  /usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so
-  ```
-
-Check:
-
-```bash
-ls -l ./models/yolov8m.hef
+# 5. Models and libraries
+ls -lh models/yolov8m.hef
 ls -l /usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so
+ls -l /usr/local/hailo/resources/barcode_labels/coco_80.json
+
+# 6. Run
+python3 driveway_counter_hailo.py
 ```
-
-If the model symlink is missing, rerun:
-
-```bash
-./setup_hailo.sh
-```
-
-### Step 5.3: Cropper Library
-
-Original code referenced:
-
-```text
-/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/libwhole_buffer.so
-```
-
-This library is part of a **full TAPPAS build** and is *not* present when only `hailo-all` / `hailo-tappas-core` are installed. The app has been updated to use `hailocropper` **without** an external `so-path`, which is supported and works as a passthrough/general cropper mode.[web:344][web:347][file:335]
-
-Do **not** reintroduce the `so-path=...libwhole_buffer.so` line unless you also install and maintain a full TAPPAS source build.
-
----
-
-## 6. Common Runtime Errors & Fixes
-
-### Most common cause: systemd service already running
-
-Before running manually, always stop the service first:
-
-    sudo systemctl stop driveway-counter.service
-
-The service is configured with `Restart=always`, so after any crash it
-respawns within 10 seconds and reclaims /dev/hailo0. Any manual launch
-attempt while the service is active will fail with HAILO_OUT_OF_PHYSICAL_DEVICES(74).
-
-Use this workflow for manual debugging:
-
-    sudo systemctl stop driveway-counter.service
-    python3 driveway_counter_hailo.py
-
-When done, restart the service:
-
-    sudo systemctl start driveway-counter.service
-
-### 6.1 `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` during pipeline start
-
-Symptoms:
-
-```text
-[HailoRT] [error] CHECK failed - Failed to create vdevice. there are not enough free devices. requested: 1, found: 0
-HAILO_OUT_OF_PHYSICAL_DEVICES(74)
-Segmentation fault
-```
-
-But:
-
-- `hailortcli scan` shows `Device: 0001:01:00.0`.
-- `hailortcli fw-control identify` works.
-
-This typically indicates:
-
-- The GStreamer pipeline is misconfigured (e.g., pointing `hailofilter` / `hailocropper` at missing or incompatible `.so` files), **not** that the hardware is actually gone.[web:340][web:355][file:335]
-
-Actions:
-
-1. Ensure no stale processes hold `/dev/hailo0`:
-
-   ```bash
-   sudo fuser -v /dev/hailo0
-   ps aux | grep hailo
-   ```
-
-   Kill if needed:
-
-   ```bash
-   sudo killall -9 python3 python
-   sudo fuser -k /dev/hailo0
-   ```
-
-2. Relax permissions (for testing):
-
-   ```bash
-   sudo chmod 666 /dev/hailo*
-   hailortcli scan
-   ```
-
-3. Verify all `so-path=` targets in the pipeline actually exist (see section 5.2) and that the cropper is **not** pointing at a missing `libwhole_buffer.so`.
-
-### 6.2 `Hailo Python module not found`
-
-Already covered in **4.3**: ensure `hailo-all` is installed and that `.venv/lib/python3.13/site-packages/system_packages.pth` contains:
-
-```text
-/usr/lib/python3/dist-packages
-```
-
----
-
-## 7. Driveway-Counter App: Sanity Checklist
-
-If the Hailo-8 hardware is fine but the driveway-counter app fails, walk this list:
-
-1. **Driver / Device:**
-
-   ```bash
-   ls -l /dev/hailo*
-   hailortcli scan
-   hailortcli fw-control identify
-   ```
-
-2. **User-space Hailo:**
-
-   ```bash
-   dpkg -l | grep hailo
-   find /usr/lib/python3/dist-packages -maxdepth 1 -name "hailo*"
-   gst-inspect-1.0 | grep hailo
-   ```
-
-3. **Python env:**
-
-   ```bash
-   cd /mnt/ssd/projects/driveway-counter
-   python3 -m venv .venv --system-site-packages
-   echo "/usr/lib/python3/dist-packages" > .venv/lib/python3.13/site-packages/system_packages.pth
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   python3 -c "import hailo"
-   ```
-
-4. **Models & libs:**
-
-   ```bash
-   ./setup_hailo.sh
-   ls -l ./models/yolov8m.hef
-   ls -l /usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so
-   ```
-
-5. **Run the app:**
-
-   ```bash
-   source .venv/bin/activate
-   python3 driveway_counter_hailo.py
-   ```
-
-If all checks pass, the driveway counter should run without needing a full TAPPAS source install.

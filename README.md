@@ -1,126 +1,242 @@
-[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-orange?logo=ai&logoColor=white)] [![RPi5](https://img.shields.io/badge/Raspberry%20Pi-5-E30B5D?logo=raspberrypi&logoColor=white)] [![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)]
+[![Hailo](https://img.shields.io/badge/Hailo-26%20TOPS-orange?logo=ai&logoColor=white)](https://hailo.ai)
+[![RPi5](https://img.shields.io/badge/Raspberry%20Pi-5-E30B5D?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com)
+[![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)](https://python.org)
 
 # Hailo Driveway Counter
 
-**15 FPS AI driveway counter on RPi 5 + Hailo 26 TOPS**  
-*Single script, 7% CPU, zone tracking, JSON reports, live Cloudflare dashboard*
+**15 FPS AI driveway counter — RPi 5 + Hailo-8 26 TOPS — 7% CPU**
+
+Single Python script. Zone-based entry/exit counting. JSON daily reports. Optional live Cloudflare dashboard.
+
+---
 
 ## Overview
 
-Turn your Raspberry Pi 5 into a high-performance AI security camera with this single-script solution. It delivers reliable driveway monitoring at 15 FPS using just 7% CPU and ~190MB RAM, with optional live metrics synced to a Cloudflare Workers dashboard viewable from anywhere.
+Turns a Raspberry Pi 5 with the Hailo-8 AI HAT into a vehicle counter that runs 24/7 as a systemd service. YOLOv8m inference runs entirely on the Hailo accelerator — the CPU handles only H.264 decoding and the Python zone logic.
 
-### What makes it stand out
+Objects crossing into the tracking zone are counted as entries; objects crossing out are counted as exits. Direction is determined by horizontal velocity so a vehicle reversing out of the driveway is correctly counted as an exit regardless of which side of the zone it started on.
 
-- Hailo AI HAT acceleration (90+ inferences/sec) eliminates GPU dependency.
-- Unique ID tracking prevents double-counting across frame boundaries.
-- Configurable polygon zones via live web interface — no manual coordinate math.
-- Midnight JSON reports: `{"date": "2026-02-21", "entries": 333, "exits": 317}` with support for any of 80 COCO object classes.
-- **Hourly Cloudflare sync** via background thread — never blocks inference.
-- **Live dashboard** showing today's totals, intraday hourly chart, and 30-day history.
-- Designed for home labs wanting production-grade computer vision without cloud dependency or complex multi-container setups. Deployable as a systemd service for 24/7 operation.
+Counts persist across restarts — if the service restarts mid-day it resumes from the existing report file rather than resetting to zero.
+
+---
 
 ## Features
 
-- Real-time object detection: any of 80 COCO classes (people, vehicles, animals, etc.).
-- H.264 / H.265 RTSP camera support.
-- Low-res at ~7% CPU, ~50°C, ~190MB RAM, ~15 FPS performance on RPi 5 + Hailo-8.
-- Single Python script deployment (`driveway_counter_hailo.py`).
-- Daily JSON reports with midnight rollover.
-- Hourly metrics upload to Cloudflare Workers KV (non-blocking background thread).
-- Web dashboard: live today summary, intraday bar chart, 30-day line chart.
+- Any of 80 COCO object classes (vehicles, people, animals, etc.)
+- H.264 / H.265 RTSP camera support
+- 2-D polygon tracking zone with accurate point-in-polygon containment
+- Bidirectional counting with velocity-based direction detection
+- Stale track cleanup — parked vehicles don't accumulate indefinitely
+- Daily JSON reports with automatic midnight rollover
+- Hourly Cloudflare Workers KV sync via non-blocking background thread
+- Live dashboard: today's totals, intraday bar chart, 30-day history
+- Live zone calibration tool (`web_calib.py`) — overlay polygon on stream before deployment
+- `Restart=always` systemd service for unattended 24/7 operation
+
+---
+
+## Hardware
+
+| Component | Spec |
+|---|---|
+| Raspberry Pi 5 | 4 GB minimum, 8 GB recommended |
+| Hailo AI HAT | Hailo-8, 26 TOPS (PCIe) |
+| Camera | Any RTSP camera with H.264 or H.265 output |
+| Storage | SSD recommended (`/mnt/ssd`) |
+
+---
+
+## Software Requirements
+
+- Raspberry Pi OS 64-bit (Debian Trixie)
+- `hailo-all` Debian package (HailoRT + GStreamer plugins + Python bindings)
+- `hailo-rpi5-examples` — run `./install.sh` once to install the YOLOv8m model and YOLO postprocess library
+- Python 3.13 system `python3`
+
+A full TAPPAS source build is **not required**.
+
+---
+
+## Quick Start
+
+```bash
+# 1. Install Hailo system packages (one-time)
+cd /mnt/ssd/projects
+git clone https://github.com/hailo-ai/hailo-rpi5-examples.git
+cd hailo-rpi5-examples && ./install.sh
+
+# 2. Clone this repo
+cd /mnt/ssd/projects
+git clone https://github.com/YOUR_USERNAME/driveway-counter.git
+cd driveway-counter
+
+# 3. Python environment
+python3 -m venv .venv --system-site-packages
+echo "/usr/lib/python3/dist-packages" \
+  > .venv/lib/python3.13/site-packages/system_packages.pth
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 4. Configure camera
+cp .env.example .env
+nano .env
+
+# 5. Set up model symlink and verify libraries
+./setup_hailo.sh
+
+# 6. Blacklist the Hailo-10 driver to prevent conflicts after kernel updates
+echo "blacklist hailo1x_pci" | sudo tee /etc/modprobe.d/hailo-blacklist.conf
+sudo update-initramfs -u
+
+# 7. Calibrate zone against live stream
+python web_calib.py   # open http://rpi.local:8081
+
+# 8. Run
+python3 driveway_counter_hailo.py
+```
+
+For full setup instructions including systemd service configuration and Cloudflare dashboard deployment, see [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md).
+
+---
+
+## Configuration
+
+All configuration lives in `.env`. Copy `.env.example` to get started.
+
+```bash
+# Camera
+USERNAME=your_username
+PASSWORD=your_password
+IPADDRESS=192.168.1.100
+CHANNEL=1
+SUBTYPE=1          # 1 = H.264 substream (recommended), 0 = H.265 main stream
+
+# Resolution — must match the selected subtype's native output
+ORIG_W=704
+ORIG_H=480
+IMG_W=704
+IMG_H=480
+
+# Detection
+CONF_THRESH=0.30   # Lower = more detections, more false positives
+
+# Zone — 4-point polygon in original resolution (top-left, top-right, bottom-right, bottom-left)
+TRACKING_ZONE=[[380,3],[480,3],[480,460],[380,460]]
+
+# Reports
+REPORT_DIR=./reports
+
+# Cloudflare (optional — leave blank to disable)
+WORKER_URL=
+CLOUDFLARE_TOKEN=
+```
+
+**Use `SUBTYPE=1`.** The H.264 substream at 704×480 runs at 15 FPS using 7% CPU. The H.265 main stream at 4K drives the Pi 5 to 100% CPU and is not viable for continuous operation.
+
+---
+
+## Zone Calibration
+
+Run `web_calib.py` to adjust the tracking zone visually against the live stream before deploying the counter:
+
+```bash
+source .venv/bin/activate
+python web_calib.py
+# Open http://rpi.local:8081
+```
+
+The yellow polygon shows the current `TRACKING_ZONE` from `.env` scaled to the stream resolution. Edit `.env` and refresh to update. The zone scales automatically to any processing resolution.
+
+---
+
+## Daily Reports
+
+```bash
+cat reports/driveway_$(date +%Y-%m-%d).json
+```
+
+```json
+{
+  "date": "2026-03-21",
+  "entries": 15,
+  "exits": 12
+}
+```
+
+Counts resume from disk on restart — a mid-day service restart does not reset the day's totals.
+
+---
+
+## Cloudflare Dashboard (Optional)
+
+Metrics sync hourly to Cloudflare Workers KV. The dashboard shows today's totals, an intraday bar chart, and 30-day history — accessible from anywhere without opening the Pi to the internet.
+
+See the [Cloudflare setup section in SETUP_GUIDE.md](docs/SETUP_GUIDE.md#cloudflare-metrics-dashboard-optional) for deployment instructions.
+
+---
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| FPS | 15 |
+| CPU | ~7% |
+| RAM | ~190 MB |
+| Temperature | ~50°C |
+| Hailo utilisation | 30–40% |
+
+**On Hailo-8:** YOLOv8m inference, YOLO NMS, letterbox preprocessing, Kalman tracking  
+**On CPU:** H.264 decode, format conversion, Python zone logic, background upload thread
+
+---
+
+## Troubleshooting
+
+See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the full guide covering:
+
+- `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` — three distinct causes including the most common one: the systemd service is already running and holding the device
+- Driver conflicts after kernel updates (`hailo1x_pci` vs `hailo_pci`)
+- Kernel driver rebuild procedure after a kernel version change
+- No detections / zero FPS
+- Python venv / Hailo module import failures
+- RTSP connection failures
+
+---
 
 ## Demo
 
 https://github.com/user-attachments/assets/208b9c0f-3f4d-4b04-af89-2d2af14d28bb
 
-Terminal output showing live detection, tracking, and zone counting. Watch real-time updates: any COCO class objects entering and exiting zones, unique tracking IDs, FPS performance, and cumulative counts.
-
-## Hardware Requirements
-
-- Raspberry Pi 5 (4GB+ recommended).
-- Hailo-8 AI HAT (26 TOPS, PCIe variant used by Raspberry Pi AI Kit).
-- RTSP-compatible IP camera (H.264 or H.265).
-- SSD storage (recommended for performance).
-
-## Software Requirements
-
-- Raspberry Pi OS (Debian Trixie, 64-bit).
-- Hailo software stack:
-  - `hailo-all` installed from Hailo’s Debian repo (provides HailoRT, GStreamer plugins, Python bindings).
-  - `hailo-rpi5-examples` cloned locally and `./install.sh` run once (installs YOLOv8m HEF model and YOLO postprocess `.so`).[file:361][web:341]
-- Python 3.13 (system `python3`).
-- GStreamer 1.0 with Hailo plugins (`hailonet`, `hailofilter`, `hailocropper`, `hailotracker`, `hailoaggregator`).[file:335][web:351]
-
-## Quick Start
-
-```bash
-# 1. Install Hailo RPi5 examples (one-time)
-cd /mnt/ssd/projects
-git clone https://github.com/hailo-ai/hailo-rpi5-examples.git
-cd hailo-rpi5-examples && ./install.sh
-
-# 2. Clone this repository
-cd /mnt/ssd/projects
-git clone https://github.com/n-vo/driveway-counter.git
-cd driveway-counter
-
-# 3. Setup Python environment (Python 3.13 with system Hailo bindings)
-python3 -m venv .venv --system-site-packages
-# Make sure venv can see /usr/lib/python3/dist-packages (where hailo.cpython-313-*.so lives)
-echo "/usr/lib/python3/dist-packages" > .venv/lib/python3.13/site-packages/system_packages.pth
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 4. Configure camera and optional Cloudflare metrics
-cp .env.example .env
-nano .env  # Add your RTSP credentials and Cloudflare tokens
-
-# 5. Setup Hailo resources (model symlink + YOLO postprocess library check)
-./setup_hailo.sh
-
-# 6. Run
-python driveway_counter_hailo.py
-```
-
-If anything fails related to Hailo drivers, Hailo Python module, or GStreamer pipeline, see:
-
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) – full driver + stack recovery guide.
-
-## Cloudflare Dashboard (Optional)
-
-The counter can sync metrics hourly to a Cloudflare Workers KV store and serve a live dashboard at your Worker URL. This requires a free Cloudflare account.
-
-**Dashboard features:**
-
-- Today's entry/exit totals updated every hour.
-- Intraday bar chart showing activity by hour.
-- 30-day history line chart.
-
-See the [Cloudflare Setup section in SETUP_GUIDE.md](docs/SETUP_GUIDE.md#-cloudflare-metrics-dashboard-optional) for full deployment instructions.
+---
 
 ## Notes on Hailo / TAPPAS
 
-- This application **does not require** a full TAPPAS source build.
-- It only depends on:
-  - Hailo’s Debian packages (`hailo-all`, `hailo-tappas-core`).
-  - The YOLOv8m HEF model and `libyolo_hailortpp_postprocess.so` installed by `hailo-rpi5-examples` / `hailo-all`.
-  - `hailocropper` running without an external `so-path` (no `libwhole_buffer.so` needed).[file:335][web:344]
+This application does not require a full TAPPAS source build. It depends only on:
 
-If you later modify the pipeline to use custom croppers or postprocess libraries under `post_processes/`, you may need a full TAPPAS source install. For the stock driveway-counter pipeline, the Debian packages and examples are sufficient.
+- Hailo Debian packages (`hailo-all`, `hailo-tappas-core`)
+- The YOLOv8m HEF model and `libyolo_hailortpp_postprocess.so` installed by `hailo-rpi5-examples`
+- `hailocropper` running without `so-path` (no `libwhole_buffer.so` needed)
+
+Do not add `so-path=...libwhole_buffer.so` to the `hailocropper` element — that library requires a full TAPPAS source install and is absent on standard `hailo-all` setups.
+
+---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
 
 ## License
 
-MIT – see [LICENSE.md](LICENSE.md).
+MIT — see [LICENSE.md](LICENSE.md).
+
+---
 
 ## Acknowledgments
 
-- [Hailo AI Documentation](https://hailo.ai/developer-zone/)
-- [Hailo RPi5 Examples](https://github.com/hailo-ai/hailo-rpi5-examples)
-- [GStreamer Hailo Plugin / TAPPAS](https://github.com/hailo-ai/tappas)
+- [Hailo AI](https://hailo.ai/developer-zone/)
+- [hailo-rpi5-examples](https://github.com/hailo-ai/hailo-rpi5-examples)
+- [TAPPAS / GStreamer Hailo plugins](https://github.com/hailo-ai/tappas)
 - [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics)
-- [YOLOv8 Model Zoo](https://github.com/hailo-ai/hailo_model_zoo)
 - [Cloudflare Workers](https://workers.cloudflare.com/)
