@@ -457,6 +457,24 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
             logger.exception("Detection error: %s", exc)
 
     # ------------------------------------------------------------------
+    # CRITICAL FIX: Stale track cleanup runs EVERY FRAME, not only when
+    # detections exist. If cleanup is inside the detection loop, unbounded
+    # track accumulation occurs during occlusion or detection gaps.
+    # Over hours, thousands of ghost tracks degrade tracker performance
+    # and cause lost detections even when the camera recovers.
+    # ------------------------------------------------------------------
+    cutoff = datetime.now()
+    stale = [
+        t
+        for t, ts in _last_seen.items()
+        if (cutoff - ts).total_seconds() > TRACK_TIMEOUT_SEC
+    ]
+    for t in stale:
+        _tracked.pop(t, None)
+        _cx_history.pop(t, None)
+        _last_seen.pop(t, None)
+
+    # ------------------------------------------------------------------
     # Periodic housekeeping
     # ------------------------------------------------------------------
     now = time.monotonic()
@@ -464,18 +482,6 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     if now - _last_log_time >= STATS_LOG_INTERVAL_SEC:
         elapsed = now - _last_log_time
         fps = _frame_count / elapsed if elapsed > 0 else 0.0
-
-        # Purge stale tracks
-        cutoff = datetime.now()
-        stale = [
-            t
-            for t, ts in _last_seen.items()
-            if (cutoff - ts).total_seconds() > TRACK_TIMEOUT_SEC
-        ]
-        for t in stale:
-            _tracked.pop(t, None)
-            _cx_history.pop(t, None)
-            _last_seen.pop(t, None)
 
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
