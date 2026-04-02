@@ -290,7 +290,8 @@ def _load_daily_stats() -> dict[str, Any]:
                 data["exits"],
             )
             return data
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("⚠️  Failed to resume report %s: %s — starting fresh", path, exc)
         pass
     return {"date": today, "entries": 0, "exits": 0}
 
