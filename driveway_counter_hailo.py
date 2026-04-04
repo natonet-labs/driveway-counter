@@ -231,6 +231,7 @@ def _cloudflare_upload_worker() -> None:
         logger.warning(
             "WORKER_URL or CLOUDFLARE_TOKEN not set — Cloudflare sync disabled"
         )
+        return
 
     while True:
         stats = _upload_queue.get()
@@ -238,33 +239,45 @@ def _cloudflare_upload_worker() -> None:
             _upload_queue.task_done()
             break
 
-        if not worker_url or not cf_token:
-            _upload_queue.task_done()
-            continue
+        retry_count = 0
+        max_retries = 3
 
-        try:
-            payload = {
-                "key": f"driveway:{stats['date']}",
-                "value": {
-                    **stats,
-                    "hour": datetime.now().hour,
-                },
-            }
-            response = requests.post(
-                worker_url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {cf_token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=10,
-            )
-            response.raise_for_status()
-            logger.info("Metrics synced to Cloudflare: %s", stats["date"])
-        except requests.RequestException as exc:
-            logger.error("Cloudflare sync failed: %s", exc)
-        finally:
-            _upload_queue.task_done()
+        while retry_count < max_retries:
+            try:
+                payload = {
+                    "key": f"driveway:{stats['date']}",
+                    "value": {
+                        **stats,
+                        "hour": datetime.now().hour,
+                    },
+                }
+                response = requests.post(
+                    worker_url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {cf_token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10,
+                )
+                response.raise_for_status()
+                logger.info("✅ Metrics synced to Cloudflare: %s", stats["date"])
+                break  # Success, exit retry loop
+            except requests.RequestException as exc:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(
+                        "❌ Cloudflare sync failed after %d retries: %s",
+                        max_retries,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "⚠️  Upload retry %d/%d: %s", retry_count, max_retries, exc
+                    )
+                    time.sleep(2)  # Brief delay before retry
+            finally:
+                _upload_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -591,9 +604,11 @@ def _on_bus_message(bus: Any, message: Any, loop: GLib.MainLoop) -> None:
     """Handle GStreamer ERROR and EOS bus messages."""
     if message.type == Gst.MessageType.ERROR:
         err, dbg = message.parse_error()
-        logger.error("GStreamer error: %s", err)
+        logger.error("🔴 GStreamer error (will retry): %s", err)
         if dbg:
             logger.debug("GStreamer debug: %s", dbg)
+        # Instead of quit, could implement reconnect here
+        # For now, let systemd Restart=always handle it
         loop.quit()
     elif message.type == Gst.MessageType.EOS:
         logger.info("End of stream")
@@ -637,6 +652,17 @@ def main() -> int:
         if not os.path.exists(path):
             logger.error("❌ %s not found: %s", label, path)
             return 1
+
+    # Validate zone has reasonable area
+    zone_pixels = np.count_nonzero(ZONE_MASK)
+    if zone_pixels == 0:
+        logger.error("❌ Tracking zone is empty or outside frame bounds")
+        return 1
+    logger.info(
+        "✅ Zone coverage: %d pixels (%.1f%% of frame)",
+        zone_pixels,
+        100 * zone_pixels / (IMG_W * IMG_H),
+    )
 
     # Background Cloudflare upload thread
     upload_thread = threading.Thread(
@@ -702,6 +728,10 @@ def main() -> int:
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
         _save_report()
+        # Force a final upload on shutdown
+        if daily_stats["entries"] > 0 or daily_stats["exits"] > 0:
+            logger.info("📤 Final snapshot on shutdown...")
+            _upload_queue.put(dict(daily_stats))
         _upload_queue.put(None)  # sentinel — tells worker to exit
         upload_thread.join(timeout=15)
         logger.info("✅ Shutdown complete")
