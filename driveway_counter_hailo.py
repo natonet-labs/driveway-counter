@@ -153,6 +153,12 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 STATS_LOG_INTERVAL_SEC: float = 10.0
 UPLOAD_INTERVAL_SEC: float = 3600.0
 
+# Detection watchdog — if Tracks=0 for this many seconds, quit and let
+# systemd Restart=always respawn the service.  Catches silent Hailo freezes
+# where the pipeline keeps running at 15 FPS but inference has stalled.
+# Set to 0 to disable.
+WATCHDOG_TIMEOUT_SEC: float = float(os.getenv("WATCHDOG_TIMEOUT_SEC", "300"))
+
 # ---------------------------------------------------------------------------
 # Zone setup
 # ---------------------------------------------------------------------------
@@ -276,8 +282,9 @@ def _cloudflare_upload_worker() -> None:
                         "⚠️  Upload retry %d/%d: %s", retry_count, max_retries, exc
                     )
                     time.sleep(2)  # Brief delay before retry
-            finally:
-                _upload_queue.task_done()
+
+        # task_done() called exactly once per item, after all retries are exhausted
+        _upload_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +352,13 @@ _frame_count: int = 0
 _last_log_time: float = time.monotonic()
 _last_upload_time: float = time.monotonic()
 
+# Watchdog: timestamp of the last frame that contained at least one tracked object.
+# Reset whenever _tracked is non-empty so parked cars keep it alive too.
+_last_track_time: float = time.monotonic()
+
+# GLib main loop reference — set in main() so the watchdog can quit it.
+_main_loop: GLib.MainLoop | None = None
+
 
 # ---------------------------------------------------------------------------
 # GStreamer frame callback
@@ -367,7 +381,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     Latch reset  : flags reset when a track goes outside the zone so the
                    same vehicle can be counted again on a subsequent pass
     """
-    global daily_stats, _frame_count, _last_log_time, _last_upload_time
+    global daily_stats, _frame_count, _last_log_time, _last_upload_time, _last_track_time
 
     sample = sink.emit("pull-sample")
     if sample is None:
@@ -493,6 +507,10 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     # ------------------------------------------------------------------
     now = time.monotonic()
 
+    # Keep watchdog alive whenever there are active tracks
+    if _tracked:
+        _last_track_time = now
+
     if now - _last_log_time >= STATS_LOG_INTERVAL_SEC:
         elapsed = now - _last_log_time
         fps = _frame_count / elapsed if elapsed > 0 else 0.0
@@ -506,6 +524,20 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
         )
         _last_log_time = now
         _frame_count = 0
+
+        # Watchdog: quit if no tracks seen for WATCHDOG_TIMEOUT_SEC.
+        # systemd Restart=always will respawn within 10 s.
+        if (
+            WATCHDOG_TIMEOUT_SEC > 0
+            and _main_loop is not None
+            and (now - _last_track_time) > WATCHDOG_TIMEOUT_SEC
+        ):
+            logger.warning(
+                "🐕 Watchdog: no tracks for %.0fs — restarting pipeline",
+                now - _last_track_time,
+            )
+            _save_report()
+            _main_loop.quit()
 
     # Hourly Cloudflare snapshot
     if now - _last_upload_time >= UPLOAD_INTERVAL_SEC:
@@ -713,6 +745,10 @@ def main() -> int:
         if ret == Gst.StateChangeReturn.FAILURE:
             logger.error("❌ Pipeline failed to enter PLAYING state")
             return 1
+
+        global _main_loop, _last_track_time
+        _main_loop = loop
+        _last_track_time = time.monotonic()  # reset on each pipeline start
 
         logger.info("🚀 Pipeline running — press Ctrl+C to stop")
         loop.run()
