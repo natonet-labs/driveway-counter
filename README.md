@@ -95,7 +95,7 @@ python web_calib.py   # open http://rpi.local:8081
 python3 driveway_counter_hailo.py
 ```
 
-For full setup instructions including systemd service configuration and Cloudflare dashboard deployment, see [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md).
+For full setup instructions including systemd service configuration and Cloudflare dashboard deployment, see [`docs/setup-guide.md`](docs/setup-guide.md).
 
 ---
 
@@ -171,7 +171,7 @@ Counts resume from disk on restart — a mid-day service restart does not reset 
 
 Metrics sync hourly to Cloudflare Workers KV. The dashboard shows today's totals, an intraday bar chart, and 30-day history — accessible from anywhere without opening the Pi to the internet.
 
-See the [Cloudflare setup section in SETUP_GUIDE.md](docs/SETUP_GUIDE.md#cloudflare-metrics-dashboard-optional) for deployment instructions.
+See the [Cloudflare setup section in setup-guide.md](docs/setup-guide.md#cloudflare-metrics-dashboard-optional) for deployment instructions.
 
 ---
 
@@ -192,7 +192,7 @@ See the [Cloudflare setup section in SETUP_GUIDE.md](docs/SETUP_GUIDE.md#cloudfl
 
 ## Troubleshooting
 
-See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the full guide covering:
+See [`docs/troubleshooting.md`](docs/troubleshooting.md) for the full guide covering:
 
 - `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` — three distinct causes including the most common one: the systemd service is already running and holding the device
 - Driver conflicts after kernel updates (`hailo1x_pci` vs `hailo_pci`)
