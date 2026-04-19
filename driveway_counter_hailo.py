@@ -618,13 +618,16 @@ def _build_pipeline(rtsp_url: str) -> str:
     )
 
 
-def _on_bus_message(bus: Any, message: Any, loop: GLib.MainLoop) -> None:
+def _on_bus_message(
+    bus: Any, message: Any, loop: GLib.MainLoop, had_error: list[bool]
+) -> None:
     """Handle GStreamer ERROR and EOS bus messages."""
     if message.type == Gst.MessageType.ERROR:
         err, dbg = message.parse_error()
         logger.error("GStreamer error: %s", err)
         if dbg:
             logger.debug("GStreamer debug: %s", dbg)
+        had_error[0] = True
         loop.quit()
     elif message.type == Gst.MessageType.EOS:
         logger.info("End of stream")
@@ -696,46 +699,85 @@ def main() -> int:
         f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
     )
 
-    # Build and start pipeline
-    pipeline: Gst.Pipeline | None = None
-    loop: GLib.MainLoop | None = None
+    # Pipeline retry loop with exponential backoff for RTSP failures.
+    # The process stays alive so Cloudflare uploads are not triggered on every
+    # reconnect attempt — only when counts actually change.
+    _BACKOFF_INITIAL = 30   # seconds before first retry
+    _BACKOFF_MAX = 300      # cap at 5 minutes
+    _GOOD_RUN_SEC = 60      # runs longer than this reset the failure counter
+    consecutive_failures = 0
 
     try:
-        pipeline_str = _build_pipeline(rtsp_url)
-        logger.debug("Pipeline:\n%s", pipeline_str)
+        while True:
+            pipeline: Gst.Pipeline | None = None
+            had_error: list[bool] = [False]
+            run_start = time.monotonic()
 
-        pipeline = Gst.parse_launch(pipeline_str)
+            try:
+                pipeline_str = _build_pipeline(rtsp_url)
+                logger.debug("Pipeline:\n%s", pipeline_str)
 
-        sink = pipeline.get_by_name("sink")
-        if sink is None:
-            logger.error("❌ appsink element 'sink' not found in pipeline")
-            return 1
-        sink.connect("new-sample", _on_new_sample)
+                pipeline = Gst.parse_launch(pipeline_str)
 
-        loop = GLib.MainLoop()
-        _main_loop = loop  # Expose to watchdog
-        bus = pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", lambda b, m: _on_bus_message(b, m, loop))
+                sink = pipeline.get_by_name("sink")
+                if sink is None:
+                    logger.error("❌ appsink element 'sink' not found in pipeline")
+                    return 1
+                sink.connect("new-sample", _on_new_sample)
 
-        ret = pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("❌ Pipeline failed to enter PLAYING state")
-            return 1
+                loop = GLib.MainLoop()
+                _main_loop = loop
+                bus = pipeline.get_bus()
+                bus.add_signal_watch()
+                bus.connect(
+                    "message",
+                    lambda b, m, he=had_error: _on_bus_message(b, m, loop, he),
+                )
 
-        logger.info("🚀 Pipeline running — press Ctrl+C to stop")
-        loop.run()
+                ret = pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    logger.error("❌ Pipeline failed to enter PLAYING state")
+                    had_error[0] = True
+                else:
+                    logger.info("🚀 Pipeline running — press Ctrl+C to stop")
+                    loop.run()
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                logger.error("Fatal error: %s", exc)
+                if IS_DEBUG:
+                    logger.exception("Traceback:")
+                had_error[0] = True
+            finally:
+                if pipeline is not None:
+                    pipeline.set_state(Gst.State.NULL)
+
+            if not had_error[0]:
+                # Clean exit (EOS, watchdog-triggered quit, etc.)
+                break
+
+            # Pipeline error — apply exponential backoff before retrying.
+            run_duration = time.monotonic() - run_start
+            if run_duration >= _GOOD_RUN_SEC:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            wait = min(_BACKOFF_INITIAL * (2 ** (consecutive_failures - 1)), _BACKOFF_MAX)
+            logger.warning(
+                "RTSP/pipeline error (failure #%d) — retrying in %ds",
+                consecutive_failures,
+                wait,
+            )
+            try:
+                time.sleep(wait)
+            except (KeyboardInterrupt, SystemExit):
+                break
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
-    except Exception as exc:
-        logger.error("Fatal error: %s", exc)
-        if IS_DEBUG:
-            logger.exception("Traceback:")
-        return 1
     finally:
-        if pipeline is not None:
-            pipeline.set_state(Gst.State.NULL)
         _save_report()
         _upload_queue.put(None)  # sentinel — tells worker to exit
         upload_thread.join(timeout=15)
