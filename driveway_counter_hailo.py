@@ -225,6 +225,7 @@ def point_in_zone(cx: int, cy: int) -> bool:
 # ---------------------------------------------------------------------------
 
 _upload_queue: queue.Queue = queue.Queue()
+_last_queued_snapshot: tuple[int, int, str] | None = None  # (entries, exits, date)
 
 
 def _cloudflare_upload_worker() -> None:
@@ -303,13 +304,19 @@ daily_stats: dict[str, Any] = _load_daily_stats()
 
 
 def _save_report() -> None:
-    """Write daily_stats to disk and queue a Cloudflare upload."""
+    """Write daily_stats to disk and queue a Cloudflare upload if data changed."""
+    global _last_queued_snapshot
     path = f"{REPORT_DIR}/driveway_{daily_stats['date']}.json"
     try:
         with open(path, "w") as fh:
             json.dump(daily_stats, fh, indent=2)
         logger.info("Report saved: %s", path)
-        _upload_queue.put(dict(daily_stats))
+        snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
+        if snapshot != _last_queued_snapshot:
+            _upload_queue.put(dict(daily_stats))
+            _last_queued_snapshot = snapshot
+        else:
+            logger.debug("Cloudflare upload skipped — data unchanged since last upload")
     except OSError as exc:
         logger.error("Failed to save report to %s: %s", path, exc)
 
@@ -523,6 +530,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     if now - _last_upload_time >= UPLOAD_INTERVAL_SEC:
         _upload_queue.put(dict(daily_stats))
         _last_upload_time = now
+        _last_queued_snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
         logger.info("📤 Hourly metrics queued for Cloudflare upload")
 
     # Midnight rollover
