@@ -413,10 +413,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
                 continue
 
             _last_seen[tid] = datetime.now()
-
-            # Update watchdog — we have at least one real detection
-            if tid not in _tracked:
-                _last_track_time = time.monotonic()
+            _last_track_time = time.monotonic()
 
             # Initialise state for new tracks
             if tid not in _tracked:
@@ -685,6 +682,11 @@ def main() -> int:
     logger.info(
         "☁️  Cloudflare upload thread started (interval=%ds)", int(UPLOAD_INTERVAL_SEC)
     )
+
+    # Upload immediately so the dashboard shows today's counts even if the
+    # watchdog fires before the first hourly interval elapses.
+    _upload_queue.put(dict(daily_stats))
+    _last_queued_snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
 
     # GStreamer init
     try:
