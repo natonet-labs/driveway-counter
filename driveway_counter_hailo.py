@@ -82,7 +82,19 @@ ORIG_H: int = int(os.getenv("ORIG_H", "480"))
 IMG_W: int = int(os.getenv("IMG_W", "704"))
 IMG_H: int = int(os.getenv("IMG_H", "480"))
 
-CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.30"))
+CONF_THRESH: float = float(os.getenv("CONF_THRESH", "0.65"))
+
+# ---------------------------------------------------------------------------
+# Detection filtering
+# ---------------------------------------------------------------------------
+
+# Minimum bounding box area in pixels (filters out tiny false positives like
+# leaves, insects, dust particles). At 704x480 resolution:
+#  - 1000 px² ≈ 32x32 box (small bird/leaf)
+#  - 2500 px² ≈ 50x50 box (sparrow to small cat)
+#  - 5000 px² ≈ 71x71 box (cat/dog size)
+#  - 10000 px² ≈ 100x100 box (person/small vehicle)
+MIN_BBOX_AREA: int = int(os.getenv("MIN_BBOX_AREA", "2500"))
 
 # ---------------------------------------------------------------------------
 # Model
@@ -133,14 +145,15 @@ APPSINK_DROP: bool = True
 
 # Minimum horizontal pixel displacement per frame to register a crossing.
 # Prevents stationary jitter from generating false counts.
-VELOCITY_THRESHOLD: int = 2
+# At 15 FPS: 5 px/frame ≈ 3 mph, 10 px/frame ≈ 6 mph
+# Leaves/noise jitter 1–2 px; real vehicles move 5+ px.
+VELOCITY_THRESHOLD: int = int(os.getenv("VELOCITY_THRESHOLD", "5"))
 
 # Centroid x-history depth for velocity smoothing
 CENTROID_HISTORY_SIZE: int = 5
 
 # Remove a track from state after this many seconds without a detection.
-# 300 s lets a parked car sit for 5 minutes before its state is wiped;
-# shorter values (e.g. 60 s) cause re-ID and potential double-counts.
+# 60s: objects disappear after 1 minute of no detections
 TRACK_TIMEOUT_SEC: int = 60
 
 # ---------------------------------------------------------------------------
@@ -152,6 +165,12 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 
 STATS_LOG_INTERVAL_SEC: float = 10.0
 UPLOAD_INTERVAL_SEC: float = 3600.0
+
+# Detection watchdog — if Tracks=0 for this many seconds, quit and let
+# systemd Restart=always respawn the service.  Catches silent Hailo freezes
+# where the pipeline keeps running at 15 FPS but inference has stalled.
+# Set to 0 to disable.
+WATCHDOG_TIMEOUT_SEC: float = float(os.getenv("WATCHDOG_TIMEOUT_SEC", "300"))
 
 # ---------------------------------------------------------------------------
 # Zone setup
@@ -187,19 +206,11 @@ _sy: float = IMG_H / ORIG_H
 TRACKING_ZONE: np.ndarray = (TRACKING_ZONE_ORIG * np.array([_sx, _sy])).astype(np.int32)
 
 # 2-D polygon mask — used for accurate point-in-polygon zone checks.
-# This replaces the previous 1-D x-range comparison which ignored the
-# polygon's y-extent and shape entirely.
 ZONE_MASK: np.ndarray = cv2.fillPoly(
     np.zeros((IMG_H, IMG_W), dtype=np.uint8),
     [TRACKING_ZONE],
     255,
 )
-
-# Pre-compute the horizontal entry/exit boundary x-coordinates from the
-# polygon's left and right extents (used for direction detection only —
-# containment uses ZONE_MASK).
-_ZONE_X_MIN: int = int(TRACKING_ZONE[:, 0].min())
-_ZONE_X_MAX: int = int(TRACKING_ZONE[:, 0].max())
 
 
 def point_in_zone(cx: int, cy: int) -> bool:
@@ -212,11 +223,9 @@ def point_in_zone(cx: int, cy: int) -> bool:
 # ---------------------------------------------------------------------------
 # Cloudflare upload — dedicated background thread
 # ---------------------------------------------------------------------------
-# The inference callback does an in-memory queue.put() (microseconds).
-# All HTTP I/O is isolated here — a slow or unreachable Cloudflare endpoint
-# never stalls the GStreamer pipeline.
 
 _upload_queue: queue.Queue = queue.Queue()
+_last_queued_snapshot: tuple[int, int, str] | None = None  # (entries, exits, date)
 
 
 def _cloudflare_upload_worker() -> None:
@@ -273,11 +282,7 @@ def _cloudflare_upload_worker() -> None:
 
 
 def _load_daily_stats() -> dict[str, Any]:
-    """Load today's JSON report from disk if it exists.
-
-    Resuming from disk means a mid-day service restart does not reset counts
-    or overwrite Cloudflare with zeroes.
-    """
+    """Load today's JSON report from disk if it exists."""
     today = datetime.now().strftime("%Y-%m-%d")
     path = f"{REPORT_DIR}/driveway_{today}.json"
     try:
@@ -299,16 +304,19 @@ daily_stats: dict[str, Any] = _load_daily_stats()
 
 
 def _save_report() -> None:
-    """Write daily_stats to disk and queue a Cloudflare upload.
-
-    Never blocks — the upload is handed off to the background thread.
-    """
+    """Write daily_stats to disk and queue a Cloudflare upload if data changed."""
+    global _last_queued_snapshot
     path = f"{REPORT_DIR}/driveway_{daily_stats['date']}.json"
     try:
         with open(path, "w") as fh:
             json.dump(daily_stats, fh, indent=2)
         logger.info("Report saved: %s", path)
-        _upload_queue.put(dict(daily_stats))
+        snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
+        if snapshot != _last_queued_snapshot:
+            _upload_queue.put(dict(daily_stats))
+            _last_queued_snapshot = snapshot
+        else:
+            logger.debug("Cloudflare upload skipped — data unchanged since last upload")
     except OSError as exc:
         logger.error("Failed to save report to %s: %s", path, exc)
 
@@ -330,6 +338,12 @@ _last_seen: dict[int, datetime] = {}
 _frame_count: int = 0
 _last_log_time: float = time.monotonic()
 _last_upload_time: float = time.monotonic()
+
+# Watchdog: timestamp of the last frame that contained at least one tracked object.
+_last_track_time: float = time.monotonic()
+
+# GLib main loop reference — set in main() so the watchdog can quit it.
+_main_loop: GLib.MainLoop | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +367,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     Latch reset  : flags reset when a track goes outside the zone so the
                    same vehicle can be counted again on a subsequent pass
     """
-    global daily_stats, _frame_count, _last_log_time, _last_upload_time
+    global daily_stats, _frame_count, _last_log_time, _last_upload_time, _last_track_time
 
     sample = sink.emit("pull-sample")
     if sample is None:
@@ -370,12 +384,28 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
             if det.get_confidence() < CONF_THRESH:
                 continue
 
+            bbox = det.get_bbox()
+            # Calculate bbox area in pixels
+            bbox_w = (bbox.xmax() - bbox.xmin()) * IMG_W
+            bbox_h = (bbox.ymax() - bbox.ymin()) * IMG_H
+            bbox_area = int(bbox_w * bbox_h)
+
+            # Filter out tiny detections (noise, leaves, insects)
+            if bbox_area < MIN_BBOX_AREA:
+                if IS_DEBUG:
+                    logger.debug(
+                        "Filtered: %s area=%d px² (below %d)",
+                        det.get_label(),
+                        bbox_area,
+                        MIN_BBOX_AREA,
+                    )
+                continue
+
             uid_list = det.get_objects_typed(hailo.HAILO_UNIQUE_ID)
             if not uid_list:
                 continue
             tid: int = uid_list[0].get_id()
 
-            bbox = det.get_bbox()
             cx = int((bbox.xmin() + bbox.xmax()) / 2 * IMG_W)
             cy = int((bbox.ymin() + bbox.ymax()) / 2 * IMG_H)
 
@@ -383,6 +413,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
                 continue
 
             _last_seen[tid] = datetime.now()
+            _last_track_time = time.monotonic()
 
             # Initialise state for new tracks
             if tid not in _tracked:
@@ -416,12 +447,13 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
                         daily_stats["entries"] += 1
                         state["counted_entry"] = True
                         logger.info(
-                            "➡️  ENTRY vx=%.1f cx=%d %s ID:%d conf=%.2f",
+                            "➡️  ENTRY vx=%.1f cx=%d %s ID:%d conf=%.2f area=%d",
                             vx,
                             cx,
                             det.get_label(),
                             tid,
                             det.get_confidence(),
+                            bbox_area,
                         )
 
                 # EXIT: inside → outside
@@ -430,12 +462,13 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
                         daily_stats["exits"] += 1
                         state["counted_exit"] = True
                         logger.info(
-                            "⬅️  EXIT  vx=%.1f cx=%d %s ID:%d conf=%.2f",
+                            "⬅️  EXIT  vx=%.1f cx=%d %s ID:%d conf=%.2f area=%d",
                             vx,
                             cx,
                             det.get_label(),
                             tid,
                             det.get_confidence(),
+                            bbox_area,
                         )
 
             state["in_zone"] = in_zone_now
@@ -443,10 +476,11 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
             if IS_DEBUG:
                 vx_debug = (history[-1] - history[-2]) if len(history) >= 2 else 0
                 logger.debug(
-                    "Track %d %s@%.2f in_zone=%s cx=%d vx=%.1f",
+                    "Track %d %s@%.2f area=%d in_zone=%s cx=%d vx=%.1f",
                     tid,
                     det.get_label(),
                     det.get_confidence(),
+                    bbox_area,
                     in_zone_now,
                     cx,
                     vx_debug,
@@ -457,6 +491,20 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
             logger.exception("Detection error: %s", exc)
 
     # ------------------------------------------------------------------
+    # Stale track cleanup runs EVERY FRAME, not only when detections exist
+    # ------------------------------------------------------------------
+    cutoff = datetime.now()
+    stale = [
+        t
+        for t, ts in _last_seen.items()
+        if (cutoff - ts).total_seconds() > TRACK_TIMEOUT_SEC
+    ]
+    for t in stale:
+        _tracked.pop(t, None)
+        _cx_history.pop(t, None)
+        _last_seen.pop(t, None)
+
+    # ------------------------------------------------------------------
     # Periodic housekeeping
     # ------------------------------------------------------------------
     now = time.monotonic()
@@ -464,18 +512,6 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     if now - _last_log_time >= STATS_LOG_INTERVAL_SEC:
         elapsed = now - _last_log_time
         fps = _frame_count / elapsed if elapsed > 0 else 0.0
-
-        # Purge stale tracks
-        cutoff = datetime.now()
-        stale = [
-            t
-            for t, ts in _last_seen.items()
-            if (cutoff - ts).total_seconds() > TRACK_TIMEOUT_SEC
-        ]
-        for t in stale:
-            _tracked.pop(t, None)
-            _cx_history.pop(t, None)
-            _last_seen.pop(t, None)
 
         logger.info(
             "📊 Entries=%d Exits=%d | FPS=%.0f | Tracks=%d",
@@ -491,6 +527,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     if now - _last_upload_time >= UPLOAD_INTERVAL_SEC:
         _upload_queue.put(dict(daily_stats))
         _last_upload_time = now
+        _last_queued_snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
         logger.info("📤 Hourly metrics queued for Cloudflare upload")
 
     # Midnight rollover
@@ -504,6 +541,18 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
         _last_upload_time = now
         logger.info("🌅 New day: %s", today)
 
+    # Watchdog: detect silent Hailo freezes
+    if WATCHDOG_TIMEOUT_SEC > 0:
+        if len(_tracked) == 0:
+            now_mono = time.monotonic()
+            if now_mono - _last_track_time > WATCHDOG_TIMEOUT_SEC:
+                logger.error(
+                    "❌ Watchdog timeout: no tracks for %.0f seconds, restarting",
+                    WATCHDOG_TIMEOUT_SEC,
+                )
+                if _main_loop is not None:
+                    _main_loop.quit()
+
     return Gst.FlowReturn.OK
 
 
@@ -513,21 +562,7 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
 
 
 def _build_pipeline(rtsp_url: str) -> str:
-    """Return the GStreamer pipeline launch string.
-
-    Design notes
-    ------------
-    * hailocropper requires so-path=libwhole_buffer.so on GStreamer 1.26+.
-      Omitting so-path causes a segfault. The library ships with hailo-tappas-core
-      at /usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/cropping_algorithms/.
-    * RTSP latency is 300 ms (local network).  The original 2000 ms added
-      unnecessary startup delay.
-    * H.264 substream (SUBTYPE=1) uses software avdec_h264 capped at
-      H264_MAX_THREADS.  H.265 main stream (SUBTYPE=0) uses the RPi5
-      hardware v4l2slh265dec — no thread cap needed.
-    * appsink drops oldest buffers under load (drop=true) to prevent
-      back-pressure stalling the pipeline.
-    """
+    """Return the GStreamer pipeline launch string."""
     if SUBTYPE == 1:
         decode = (
             f"rtph264depay ! h264parse ! " f"avdec_h264 max-threads={H264_MAX_THREADS}"
@@ -549,7 +584,7 @@ def _build_pipeline(rtsp_url: str) -> str:
             f"application/x-rtp,media=video ! {decode} !",
             f"videoconvert ! video/x-raw,format=RGB !",
             f"videoscale ! video/x-raw,format=RGB,width={IMG_W},height={IMG_H} !",
-            # hailocropper requires so-path on GStreamer 1.26+ — omitting it segfaults
+            # hailocropper requires so-path on GStreamer 1.26+
             f"hailocropper name=cropper"
             f" so-path={WHOLE_BUFFER_SO}"
             f" function-name=create_crops"
@@ -580,13 +615,16 @@ def _build_pipeline(rtsp_url: str) -> str:
     )
 
 
-def _on_bus_message(bus: Any, message: Any, loop: GLib.MainLoop) -> None:
+def _on_bus_message(
+    bus: Any, message: Any, loop: GLib.MainLoop, had_error: list[bool]
+) -> None:
     """Handle GStreamer ERROR and EOS bus messages."""
     if message.type == Gst.MessageType.ERROR:
         err, dbg = message.parse_error()
         logger.error("GStreamer error: %s", err)
         if dbg:
             logger.debug("GStreamer debug: %s", dbg)
+        had_error[0] = True
         loop.quit()
     elif message.type == Gst.MessageType.EOS:
         logger.info("End of stream")
@@ -605,6 +643,8 @@ def main() -> int:
         0 on clean exit or keyboard interrupt
         1 on configuration / pipeline error
     """
+    global _main_loop
+
     logger.info("🚗 Driveway Counter (Hailo-8 26 TOPS)")
     logger.info("📍 Tracking Zone (processing res): %s", TRACKING_ZONE.tolist())
     logger.info(
@@ -615,8 +655,9 @@ def main() -> int:
         IMG_H,
     )
     logger.info("📊 Confidence threshold: %.2f", CONF_THRESH)
+    logger.info("📏 Min detection size: %d px²", MIN_BBOX_AREA)
     logger.info(
-        "📈 Tracking: timeout=%ds  velocity_thr=%dpx",
+        "📈 Tracking: timeout=%ds  velocity_thr=%d px/frame",
         TRACK_TIMEOUT_SEC,
         VELOCITY_THRESHOLD,
     )
@@ -642,6 +683,11 @@ def main() -> int:
         "☁️  Cloudflare upload thread started (interval=%ds)", int(UPLOAD_INTERVAL_SEC)
     )
 
+    # Upload immediately so the dashboard shows today's counts even if the
+    # watchdog fires before the first hourly interval elapses.
+    _upload_queue.put(dict(daily_stats))
+    _last_queued_snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
+
     # GStreamer init
     try:
         Gst.init(None)
@@ -655,45 +701,85 @@ def main() -> int:
         f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
     )
 
-    # Build and start pipeline
-    pipeline: Gst.Pipeline | None = None
-    loop: GLib.MainLoop | None = None
+    # Pipeline retry loop with exponential backoff for RTSP failures.
+    # The process stays alive so Cloudflare uploads are not triggered on every
+    # reconnect attempt — only when counts actually change.
+    _BACKOFF_INITIAL = 30   # seconds before first retry
+    _BACKOFF_MAX = 300      # cap at 5 minutes
+    _GOOD_RUN_SEC = 60      # runs longer than this reset the failure counter
+    consecutive_failures = 0
 
     try:
-        pipeline_str = _build_pipeline(rtsp_url)
-        logger.debug("Pipeline:\n%s", pipeline_str)
+        while True:
+            pipeline: Gst.Pipeline | None = None
+            had_error: list[bool] = [False]
+            run_start = time.monotonic()
 
-        pipeline = Gst.parse_launch(pipeline_str)
+            try:
+                pipeline_str = _build_pipeline(rtsp_url)
+                logger.debug("Pipeline:\n%s", pipeline_str)
 
-        sink = pipeline.get_by_name("sink")
-        if sink is None:
-            logger.error("❌ appsink element 'sink' not found in pipeline")
-            return 1
-        sink.connect("new-sample", _on_new_sample)
+                pipeline = Gst.parse_launch(pipeline_str)
 
-        loop = GLib.MainLoop()
-        bus = pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", lambda b, m: _on_bus_message(b, m, loop))
+                sink = pipeline.get_by_name("sink")
+                if sink is None:
+                    logger.error("❌ appsink element 'sink' not found in pipeline")
+                    return 1
+                sink.connect("new-sample", _on_new_sample)
 
-        ret = pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("❌ Pipeline failed to enter PLAYING state")
-            return 1
+                loop = GLib.MainLoop()
+                _main_loop = loop
+                bus = pipeline.get_bus()
+                bus.add_signal_watch()
+                bus.connect(
+                    "message",
+                    lambda b, m, he=had_error: _on_bus_message(b, m, loop, he),
+                )
 
-        logger.info("🚀 Pipeline running — press Ctrl+C to stop")
-        loop.run()
+                ret = pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    logger.error("❌ Pipeline failed to enter PLAYING state")
+                    had_error[0] = True
+                else:
+                    logger.info("🚀 Pipeline running — press Ctrl+C to stop")
+                    loop.run()
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                logger.error("Fatal error: %s", exc)
+                if IS_DEBUG:
+                    logger.exception("Traceback:")
+                had_error[0] = True
+            finally:
+                if pipeline is not None:
+                    pipeline.set_state(Gst.State.NULL)
+
+            if not had_error[0]:
+                # Clean exit (EOS, watchdog-triggered quit, etc.)
+                break
+
+            # Pipeline error — apply exponential backoff before retrying.
+            run_duration = time.monotonic() - run_start
+            if run_duration >= _GOOD_RUN_SEC:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            wait = min(_BACKOFF_INITIAL * (2 ** (consecutive_failures - 1)), _BACKOFF_MAX)
+            logger.warning(
+                "RTSP/pipeline error (failure #%d) — retrying in %ds",
+                consecutive_failures,
+                wait,
+            )
+            try:
+                time.sleep(wait)
+            except (KeyboardInterrupt, SystemExit):
+                break
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
-    except Exception as exc:
-        logger.error("Fatal error: %s", exc)
-        if IS_DEBUG:
-            logger.exception("Traceback:")
-        return 1
     finally:
-        if pipeline is not None:
-            pipeline.set_state(Gst.State.NULL)
         _save_report()
         _upload_queue.put(None)  # sentinel — tells worker to exit
         upload_thread.join(timeout=15)
