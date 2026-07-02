@@ -388,8 +388,8 @@ driveway-counter/
 │   └── yolov8m.hef            # Symlink → system model (30 MB)
 ├── reports/                    # Daily JSON reports (not in git)
 └── docs/
-    ├── SETUP_GUIDE.md          # This file
-    └── TROUBLESHOOTING.md
+    ├── setup-guide.md          # This file
+    └── troubleshooting.md
 ```
 
 ---
