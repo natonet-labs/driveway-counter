@@ -172,6 +172,16 @@ UPLOAD_INTERVAL_SEC: float = 3600.0
 # Set to 0 to disable.
 WATCHDOG_TIMEOUT_SEC: float = float(os.getenv("WATCHDOG_TIMEOUT_SEC", "300"))
 
+# Frame watchdog — if no frame has been delivered at all for this many
+# seconds, quit and let systemd Restart=always respawn the service.
+# Catches a fully wedged pipeline (e.g. an RTSP session that hangs without a
+# clean disconnect, so GStreamer never raises a bus ERROR/EOS): in that case
+# _on_new_sample stops being called entirely, so the Tracks-based watchdog
+# above — which only runs *inside* that callback — never gets a chance to
+# fire either, and the process blocks in the main loop forever.
+# Set to 0 to disable.
+FRAME_STALL_TIMEOUT_SEC: float = float(os.getenv("FRAME_STALL_TIMEOUT_SEC", "60"))
+
 # ---------------------------------------------------------------------------
 # Zone setup
 # ---------------------------------------------------------------------------
@@ -342,6 +352,11 @@ _last_upload_time: float = time.monotonic()
 # Watchdog: timestamp of the last frame that contained at least one tracked object.
 _last_track_time: float = time.monotonic()
 
+# Frame watchdog: timestamp of the last frame delivered at all, tracked/detected
+# or not. Updated unconditionally on every _on_new_sample invocation so the
+# independent GLib timer below can detect a fully wedged pipeline.
+_last_frame_time: float = time.monotonic()
+
 # GLib main loop reference — set in main() so the watchdog can quit it.
 _main_loop: GLib.MainLoop | None = None
 
@@ -367,12 +382,14 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
     Latch reset  : flags reset when a track goes outside the zone so the
                    same vehicle can be counted again on a subsequent pass
     """
-    global daily_stats, _frame_count, _last_log_time, _last_upload_time, _last_track_time
+    global daily_stats, _frame_count, _last_log_time, _last_upload_time
+    global _last_track_time, _last_frame_time
 
     sample = sink.emit("pull-sample")
     if sample is None:
         return Gst.FlowReturn.OK
 
+    _last_frame_time = time.monotonic()
     _frame_count += 1
     buf = sample.get_buffer()
 
@@ -631,6 +648,29 @@ def _on_bus_message(
         loop.quit()
 
 
+def _check_frame_stall(loop: GLib.MainLoop) -> bool:
+    """GLib timer callback — detects a fully wedged pipeline.
+
+    Runs on a fixed interval independent of _on_new_sample, so unlike the
+    Tracks-based watchdog it still fires even when zero frames are being
+    delivered at all (e.g. an RTSP session hung without a clean disconnect,
+    so GStreamer never raises a bus ERROR/EOS and _on_new_sample never runs).
+    """
+    if FRAME_STALL_TIMEOUT_SEC <= 0:
+        return GLib.SOURCE_CONTINUE
+
+    elapsed = time.monotonic() - _last_frame_time
+    if elapsed > FRAME_STALL_TIMEOUT_SEC:
+        logger.error(
+            "❌ Frame watchdog timeout: no frames received for %.0f seconds, restarting",
+            elapsed,
+        )
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    return GLib.SOURCE_CONTINUE
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -643,7 +683,7 @@ def main() -> int:
         0 on clean exit or keyboard interrupt
         1 on configuration / pipeline error
     """
-    global _main_loop
+    global _main_loop, _last_frame_time
 
     logger.info("🚗 Driveway Counter (Hailo-8 26 TOPS)")
     logger.info("📍 Tracking Zone (processing res): %s", TRACKING_ZONE.tolist())
@@ -660,6 +700,11 @@ def main() -> int:
         "📈 Tracking: timeout=%ds  velocity_thr=%d px/frame",
         TRACK_TIMEOUT_SEC,
         VELOCITY_THRESHOLD,
+    )
+    logger.info(
+        "🐕 Watchdogs: tracks_timeout=%ds  frame_stall_timeout=%ds",
+        int(WATCHDOG_TIMEOUT_SEC),
+        int(FRAME_STALL_TIMEOUT_SEC),
     )
 
     # Preflight checks
@@ -714,6 +759,7 @@ def main() -> int:
             pipeline: Gst.Pipeline | None = None
             had_error: list[bool] = [False]
             run_start = time.monotonic()
+            stall_source_id: int | None = None
 
             try:
                 pipeline_str = _build_pipeline(rtsp_url)
@@ -736,6 +782,12 @@ def main() -> int:
                     lambda b, m, he=had_error: _on_bus_message(b, m, loop, he),
                 )
 
+                _last_frame_time = time.monotonic()
+                if FRAME_STALL_TIMEOUT_SEC > 0:
+                    stall_source_id = GLib.timeout_add_seconds(
+                        15, _check_frame_stall, loop
+                    )
+
                 ret = pipeline.set_state(Gst.State.PLAYING)
                 if ret == Gst.StateChangeReturn.FAILURE:
                     logger.error("❌ Pipeline failed to enter PLAYING state")
@@ -752,6 +804,8 @@ def main() -> int:
                     logger.exception("Traceback:")
                 had_error[0] = True
             finally:
+                if stall_source_id is not None:
+                    GLib.source_remove(stall_source_id)
                 if pipeline is not None:
                     pipeline.set_state(Gst.State.NULL)
 
