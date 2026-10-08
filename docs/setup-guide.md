@@ -39,7 +39,7 @@ This installs:
 
 ```bash
 cd /mnt/ssd/projects
-git clone https://github.com/YOUR_USERNAME/driveway-counter.git
+git clone https://github.com/natonet-labs/driveway-counter.git
 cd driveway-counter
 ```
 
@@ -83,7 +83,7 @@ Key settings:
 | `SUBTYPE` | `1` = H.264 substream (~7% CPU), `0` = H.265 main stream (~100% CPU — avoid) |
 | `ORIG_W` / `ORIG_H` | Native resolution of the selected stream |
 | `IMG_W` / `IMG_H` | Processing resolution (match `ORIG_W`/`ORIG_H` for substream) |
-| `CONF_THRESH` | Detection confidence threshold (0.25–0.45 is typical) |
+| `CONF_THRESH` | Detection confidence threshold — `0.65` tuned default, see [tuning guide](tuning-guide.md) |
 | `TRACKING_ZONE` | 4-point polygon in original resolution coordinates |
 
 **Use `SUBTYPE=1` (H.264 substream).** The H.265 main stream at 4K drives CPU to 100% on the Pi 5. The substream at 704×480 runs at 15 FPS using 7% CPU.
