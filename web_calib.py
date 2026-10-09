@@ -7,8 +7,18 @@ with an overlaid tracking zone polygon for coordinate calibration.
 
 Usage:
     python web_calib.py
-    Open http://rpi.local:8081       — calibration UI
-    Open http://rpi.local:8081/video — raw MJPEG stream
+    Open http://127.0.0.1:8081       — calibration UI
+    Open http://127.0.0.1:8081/video — raw MJPEG stream
+
+The server binds to localhost by default. It serves the live camera feed
+with no authentication, so exposing it on the LAN means anyone who can
+reach the port can watch the stream. To view it from another machine,
+forward the port over SSH:
+
+    ssh -L 8081:localhost:8081 pi@rpi.local
+
+Set FLASK_HOST=0.0.0.0 to bind all interfaces instead — only do that on a
+network you trust.
 
 Environment variables (via .env):
     USERNAME      Camera username
@@ -29,6 +39,7 @@ import logging
 import os
 import time
 from typing import Generator, Optional, Tuple
+from urllib.parse import quote
 
 import cv2
 import numpy as np
@@ -62,16 +73,19 @@ SUBTYPE: str = os.getenv("SUBTYPE", "0")
 ORIG_W: int = int(os.getenv("ORIG_W", 704))
 ORIG_H: int = int(os.getenv("ORIG_H", 480))
 
-FLASK_HOST: str = "0.0.0.0"
+# Bind to localhost by default: /video is an unauthenticated live camera
+# feed, so binding all interfaces exposes it to everyone on the network.
+# Override with FLASK_HOST=0.0.0.0 on a trusted LAN, or use an SSH tunnel.
+FLASK_HOST: str = os.getenv("FLASK_HOST", "127.0.0.1")
 FLASK_PORT: int = int(os.getenv("FLASK_PORT", 8081))
 
 RTSP_URL: str = (
-    f"rtsp://{USERNAME}:{PASSWORD}@{IP_ADDRESS}:554"
+    f"rtsp://{quote(USERNAME, safe='')}:{quote(PASSWORD, safe='')}@{IP_ADDRESS}:554"
     f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
 )
 
 RTSP_MASKED_URL: str = (
-    f"rtsp://{USERNAME}:***@{IP_ADDRESS}:554"
+    f"rtsp://{quote(USERNAME, safe='')}:***@{IP_ADDRESS}:554"
     f"/cam/realmonitor?channel={CHANNEL}&subtype={SUBTYPE}"
 )
 
@@ -297,6 +311,12 @@ def main() -> int:
         logger.info(
             "Zone (original %dx%d): %s", ORIG_W, ORIG_H, TRACKING_ZONE_ORIG.tolist()
         )
+        if FLASK_HOST not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(
+                "Binding %s — the live camera stream is reachable by anyone "
+                "on this network with no authentication",
+                FLASK_HOST,
+            )
         logger.info("Starting server → http://%s:%d", FLASK_HOST, FLASK_PORT)
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)
     except RuntimeError as e:

@@ -149,7 +149,15 @@ source .venv/bin/activate
 python web_calib.py
 ```
 
-Open `http://rpi.local:8081` in a browser. The yellow polygon shows the current `TRACKING_ZONE` from `.env` overlaid on the live stream. Edit the coordinates in `.env` and refresh the page to update.
+The server binds to `127.0.0.1` by default, because `/video` is a live camera feed with no authentication. To view it from another machine, forward the port over SSH from your laptop:
+
+```bash
+ssh -L 8081:localhost:8081 pi@rpi.local
+```
+
+Then open `http://localhost:8081` in a browser on your laptop. If you'd rather reach it directly at `http://rpi.local:8081`, set `FLASK_HOST=0.0.0.0` in `.env` — only on a network you trust, since anyone who can reach the port can watch the stream.
+
+The yellow polygon shows the current `TRACKING_ZONE` from `.env` overlaid on the live stream. Edit the coordinates in `.env` and refresh the page to update.
 
 The zone should cover the driveway entrance — objects crossing the left or right boundary of the polygon are counted as entries or exits depending on direction of travel.
 
