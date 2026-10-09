@@ -14,7 +14,7 @@ Single Python script. Zone-based entry/exit counting. JSON daily reports. Option
 
 Turns a Raspberry Pi 5 with the Hailo-8 AI HAT into a vehicle counter that runs 24/7 as a systemd service. YOLOv8m inference runs entirely on the Hailo accelerator — the CPU handles only H.264 decoding and the Python zone logic.
 
-Objects crossing into the tracking zone are counted as entries; objects crossing out are counted as exits. Direction is determined by horizontal velocity so a vehicle reversing out of the driveway is correctly counted as an exit regardless of which side of the zone it started on.
+Objects crossing into the tracking zone are counted as entries; objects crossing out are counted as exits. The direction comes from the zone transition itself, so a vehicle reversing out of the driveway is counted as an exit regardless of which side it started on. A horizontal-velocity threshold gates the count so stationary jitter — a parked car's bounding box drifting a pixel or two — never registers.
 
 Counts persist across restarts — if the service restarts mid-day it resumes from the existing report file rather than resetting to zero.
 
@@ -67,7 +67,7 @@ cd hailo-rpi5-examples && ./install.sh
 
 # 2. Clone this repo
 cd /mnt/ssd/projects
-git clone https://github.com/YOUR_USERNAME/driveway-counter.git
+git clone https://github.com/natonet-labs/driveway-counter.git
 cd driveway-counter
 
 # 3. Python environment
@@ -118,7 +118,7 @@ IMG_W=704
 IMG_H=480
 
 # Detection
-CONF_THRESH=0.30   # Lower = more detections, more false positives
+CONF_THRESH=0.65   # Lower = more detections, more false positives
 
 # Zone — 4-point polygon in original resolution (top-left, top-right, bottom-right, bottom-left)
 TRACKING_ZONE=[[380,3],[480,3],[480,460],[380,460]]
@@ -215,9 +215,14 @@ This application does not require a full TAPPAS source build. It depends only on
 
 - Hailo Debian packages (`hailo-all`, `hailo-tappas-core`)
 - The YOLOv8m HEF model and `libyolo_hailortpp_postprocess.so` installed by `hailo-rpi5-examples`
-- `hailocropper` running without `so-path` (no `libwhole_buffer.so` needed)
+- `libwhole_buffer.so`, passed to `hailocropper` via `so-path` (ships with `hailo-tappas-core`)
 
-Do not add `so-path=...libwhole_buffer.so` to the `hailocropper` element — that library requires a full TAPPAS source install and is absent on standard `hailo-all` setups.
+**GStreamer 1.26+ requires `so-path` on `hailocropper`.** Earlier versions handled the
+no-`so-path` passthrough mode correctly; 1.26.2 segfaults during `pipeline.set_state(PLAYING)`
+without it. The library is present on a standard `hailo-all` install via `hailo-tappas-core` — a
+full TAPPAS source build is still not needed. See
+[`docs/troubleshooting.md`](docs/troubleshooting.md#issue-4-hailocropper-segfault-on-gstreamer-126)
+for the full diagnosis.
 
 ---
 
