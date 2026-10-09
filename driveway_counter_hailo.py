@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -66,6 +67,23 @@ logger: logging.Logger = logging.getLogger(__name__)
 IS_DEBUG: bool = os.getenv("ISDEBUG", "False").lower() == "true"
 if IS_DEBUG:
     logger.setLevel(logging.DEBUG)
+
+# Matches the password field of an rtsp://user:password@host URL.
+_RTSP_CREDENTIALS = re.compile(r"(rtsp://[^:@/\s]+:)[^@\s]+(@)")
+
+
+def _mask_credentials(text: str) -> str:
+    """Replace the password in any RTSP URL within *text* with ``***``.
+
+    Both the GStreamer pipeline description and rtspsrc's own error strings
+    embed the full RTSP URL. Logging either verbatim writes the camera
+    password into the journal — and CONTRIBUTING.md asks users to run with
+    ISDEBUG=True and share those logs when reporting a problem.
+
+    Returns:
+        str: *text* with every RTSP password replaced by ``***``.
+    """
+    return _RTSP_CREDENTIALS.sub(r"\1***\2", text)
 
 # ---------------------------------------------------------------------------
 # Camera / stream configuration
@@ -638,9 +656,9 @@ def _on_bus_message(
     """Handle GStreamer ERROR and EOS bus messages."""
     if message.type == Gst.MessageType.ERROR:
         err, dbg = message.parse_error()
-        logger.error("GStreamer error: %s", err)
+        logger.error("GStreamer error: %s", _mask_credentials(str(err)))
         if dbg:
-            logger.debug("GStreamer debug: %s", dbg)
+            logger.debug("GStreamer debug: %s", _mask_credentials(dbg))
         had_error[0] = True
         loop.quit()
     elif message.type == Gst.MessageType.EOS:
@@ -763,7 +781,7 @@ def main() -> int:
 
             try:
                 pipeline_str = _build_pipeline(rtsp_url)
-                logger.debug("Pipeline:\n%s", pipeline_str)
+                logger.debug("Pipeline:\n%s", _mask_credentials(pipeline_str))
 
                 pipeline = Gst.parse_launch(pipeline_str)
 

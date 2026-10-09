@@ -89,7 +89,7 @@ echo "blacklist hailo1x_pci" | sudo tee /etc/modprobe.d/hailo-blacklist.conf
 sudo update-initramfs -u
 
 # 7. Calibrate zone against live stream
-python web_calib.py   # open http://rpi.local:8081
+python web_calib.py   # localhost only — see Zone Calibration below
 
 # 8. Run
 python3 driveway_counter_hailo.py
@@ -142,8 +142,15 @@ Run `web_calib.py` to adjust the tracking zone visually against the live stream 
 ```bash
 source .venv/bin/activate
 python web_calib.py
-# Open http://rpi.local:8081
 ```
+
+The server binds to `127.0.0.1` by default because the stream has no authentication. To view it from your laptop, forward the port over SSH and open `http://localhost:8081`:
+
+```bash
+ssh -L 8081:localhost:8081 pi@rpi.local
+```
+
+Alternatively, set `FLASK_HOST=0.0.0.0` in `.env` to serve it on the LAN and open `http://rpi.local:8081`. Only do that on a network you trust — anyone who can reach the port can watch the camera feed.
 
 The yellow polygon shows the current `TRACKING_ZONE` from `.env` scaled to the stream resolution. Edit `.env` and refresh to update. The zone scales automatically to any processing resolution.
 
