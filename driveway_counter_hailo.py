@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import re
+import signal
 import threading
 import time
 from collections import deque
@@ -184,6 +185,12 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 STATS_LOG_INTERVAL_SEC: float = 10.0
 UPLOAD_INTERVAL_SEC: float = 3600.0
 
+# How often today's counts are checkpointed to disk (only when they changed).
+# The report used to be written only at midnight and on a clean shutdown, so
+# a reboot, power cut or SIGKILL lost every count since the last clean exit.
+# This bounds the loss to one interval. Disk-only: uploads stay hourly.
+REPORT_SAVE_INTERVAL_SEC: float = 60.0
+
 # Detection watchdog — if Tracks=0 for this many seconds, quit and let
 # systemd Restart=always respawn the service.  Catches silent Hailo freezes
 # where the pipeline keeps running at 15 FPS but inference has stalled.
@@ -331,22 +338,57 @@ def _load_daily_stats() -> dict[str, Any]:
 daily_stats: dict[str, Any] = _load_daily_stats()
 
 
-def _save_report() -> None:
-    """Write daily_stats to disk and queue a Cloudflare upload if data changed."""
-    global _last_queued_snapshot
+def _write_report() -> str | None:
+    """Atomically write daily_stats to today's report file.
+
+    Writes to a temp file, fsyncs, then renames over the report, so a power
+    cut mid-write can never leave a truncated JSON file (which
+    _load_daily_stats would silently treat as "start from zero").
+
+    Returns:
+        str | None: the report path, or None if the write failed.
+    """
     path = f"{REPORT_DIR}/driveway_{daily_stats['date']}.json"
+    tmp_path = f"{path}.tmp"
     try:
-        with open(path, "w") as fh:
+        with open(tmp_path, "w") as fh:
             json.dump(daily_stats, fh, indent=2)
-        logger.info("Report saved: %s", path)
-        snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
-        if snapshot != _last_queued_snapshot:
-            _upload_queue.put(dict(daily_stats))
-            _last_queued_snapshot = snapshot
-        else:
-            logger.debug("Cloudflare upload skipped — data unchanged since last upload")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
     except OSError as exc:
         logger.error("Failed to save report to %s: %s", path, exc)
+        return None
+    return path
+
+
+def _checkpoint_report(now: float) -> None:
+    """Write the report to disk (no upload) every REPORT_SAVE_INTERVAL_SEC,
+    if the counts changed since the last write."""
+    global _last_save_time, _last_saved_snapshot
+    if now - _last_save_time < REPORT_SAVE_INTERVAL_SEC:
+        return
+    _last_save_time = now
+    snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
+    if snapshot != _last_saved_snapshot and _write_report() is not None:
+        _last_saved_snapshot = snapshot
+        logger.debug("Report checkpointed: entries=%d exits=%d", snapshot[0], snapshot[1])
+
+
+def _save_report() -> None:
+    """Write daily_stats to disk and queue a Cloudflare upload if data changed."""
+    global _last_queued_snapshot, _last_saved_snapshot
+    path = _write_report()
+    if path is None:
+        return
+    logger.info("Report saved: %s", path)
+    snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
+    _last_saved_snapshot = snapshot
+    if snapshot != _last_queued_snapshot:
+        _upload_queue.put(dict(daily_stats))
+        _last_queued_snapshot = snapshot
+    else:
+        logger.debug("Cloudflare upload skipped — data unchanged since last upload")
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +409,14 @@ _frame_count: int = 0
 _last_log_time: float = time.monotonic()
 _last_upload_time: float = time.monotonic()
 
+# Periodic disk checkpoint: when it last ran and what it last wrote.
+_last_save_time: float = time.monotonic()
+_last_saved_snapshot: tuple[int, int, str] = (
+    daily_stats["entries"],
+    daily_stats["exits"],
+    daily_stats["date"],
+)
+
 # Watchdog: timestamp of the last frame that contained at least one tracked object.
 _last_track_time: float = time.monotonic()
 
@@ -377,6 +427,9 @@ _last_frame_time: float = time.monotonic()
 
 # GLib main loop reference — set in main() so the watchdog can quit it.
 _main_loop: GLib.MainLoop | None = None
+
+# Set by the SIGTERM handler so main() exits instead of reconnecting.
+_stop_requested: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +618,8 @@ def _on_new_sample(sink: Any) -> Gst.FlowReturn:
         _last_queued_snapshot = (daily_stats["entries"], daily_stats["exits"], daily_stats["date"])
         logger.info("📤 Hourly metrics queued for Cloudflare upload")
 
+    _checkpoint_report(now)
+
     # Midnight rollover
     today = datetime.now().strftime("%Y-%m-%d")
     if daily_stats["date"] != today:
@@ -666,6 +721,25 @@ def _on_bus_message(
         loop.quit()
 
 
+def _on_stop_signal(signum: int, _frame: Any) -> None:
+    """Handle SIGTERM (systemctl stop/restart, reboot) with a clean shutdown.
+
+    Python's default SIGTERM action kills the process without running any
+    finally blocks, so main()'s shutdown path — which saves the report — was
+    skipped and every count since the last save was lost. Route SIGTERM
+    through the same exit as a watchdog quit instead. PyGObject runs Python
+    signal handlers while the GLib main loop is blocked, so this fires
+    promptly in both cases below.
+    """
+    global _stop_requested
+    logger.info("🛑 Received %s — saving and shutting down", signal.Signals(signum).name)
+    _stop_requested = True
+    if _main_loop is not None and _main_loop.is_running():
+        _main_loop.quit()  # main() sees _stop_requested and leaves the retry loop
+    else:
+        raise SystemExit(0)  # e.g. mid reconnect backoff; main()'s finally still runs
+
+
 def _check_frame_stall(loop: GLib.MainLoop) -> bool:
     """GLib timer callback — detects a fully wedged pipeline.
 
@@ -745,6 +819,8 @@ def main() -> int:
     logger.info(
         "☁️  Cloudflare upload thread started (interval=%ds)", int(UPLOAD_INTERVAL_SEC)
     )
+
+    signal.signal(signal.SIGTERM, _on_stop_signal)
 
     # Upload immediately so the dashboard shows today's counts even if the
     # watchdog fires before the first hourly interval elapses.
@@ -827,8 +903,8 @@ def main() -> int:
                 if pipeline is not None:
                     pipeline.set_state(Gst.State.NULL)
 
-            if not had_error[0]:
-                # Clean exit (EOS, watchdog-triggered quit, etc.)
+            if not had_error[0] or _stop_requested:
+                # Clean exit (EOS, watchdog-triggered quit, SIGTERM, etc.)
                 break
 
             # Pipeline error — apply exponential backoff before retrying.
