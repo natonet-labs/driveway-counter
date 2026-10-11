@@ -3,6 +3,12 @@
 Thanks for taking an interest. This is a personal project built around specific
 hardware, so please read the testing note below before opening a pull request.
 
+This file covers what's specific to driveway-counter. Commit messages and
+general PR guidance follow the
+[natonet-labs contributing guide](https://github.com/natonet-labs/.github/blob/main/CONTRIBUTING.md),
+and security issues should be reported privately as described in the
+[security policy](https://github.com/natonet-labs/.github/blob/main/SECURITY.md).
+
 ## Hardware reality
 
 Most of this code cannot be exercised without the target stack:
@@ -48,26 +54,6 @@ If you have `black` and `ruff` available, running them keeps diffs small:
 ```bash
 black .
 ruff check --fix .
-```
-
-## Commit messages
-
-[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
-
-```
-type(scope): short summary
-
-Body explaining what changed and why, wrapped at 72 characters.
-```
-
-Types: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `chore`.
-
-Examples:
-
-```
-feat(zone): add second tracking zone for the sidewalk
-fix(tracker): reset latch when a track leaves the frame
-docs(readme): correct the hailocropper so-path guidance
 ```
 
 ## Pull requests
